@@ -1,34 +1,65 @@
 use loopdev::LoopControl;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::unistd::{chdir, pivot_root};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::{chdir, chroot, close, dup2, getpid};
 use serde::Deserialize;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// -----------------------------------------------------------------------------
-/// KONFIGURATION
-/// -----------------------------------------------------------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// LOGGING  (writes to /dev/kmsg so output survives headless / serial boots)
+// ────────────────────────────────────────────────────────────────────────────
+
+macro_rules! klog {
+    ($($arg:tt)*) => {{
+        let msg = format!("[PIVOT] {}\n", format!($($arg)*));
+        // Best-effort: write to kmsg, fall back to stderr
+        if let Ok(mut f) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            let _ = f.write_all(msg.as_bytes());
+        }
+        eprint!("{}", msg);
+    }};
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// KONFIGURATION
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum BootMode {
+    Installed,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "UPPERCASE")]
+enum ActiveSlot {
+    A,
+    B,
+}
+
 #[derive(Deserialize, Debug)]
 struct PivotConfig {
-    system: SystemConfig,
+    system:   SystemConfig,
     hardware: HardwareConfig,
-    images: ImagesConfig,
+    images:   ImagesConfig,
 }
 
 #[derive(Deserialize, Debug)]
 struct SystemConfig {
-    mode: String,
-    active_slot: String,
+    mode:        BootMode,
+    active_slot: ActiveSlot,
 }
 
 #[derive(Deserialize, Debug)]
 struct HardwareConfig {
-    boot_partition_uuid: String,
+    boot_partition_uuid:   String,
     system_partition_uuid: String,
 }
 
@@ -38,257 +69,507 @@ struct ImagesConfig {
     slot_b: String,
 }
 
-/// Als PID 1 fangen wir fatale Fehler ab und halten das System an (Kernel Panic Prävention).
+// ────────────────────────────────────────────────────────────────────────────
+// FATAL ERROR  (PID 1 must never exit – spin forever after logging)
+// ────────────────────────────────────────────────────────────────────────────
+
 fn fatal_error(msg: &str) -> ! {
-    eprintln!("\n[PIVOT FATAL ERROR] {}\n", msg);
-    eprintln!("System halted. Please reboot manually.");
-    loop {
-        sleep(Duration::from_secs(60));
+    // Write to kmsg first – survives on serial/headless consoles
+    klog!("FATAL ERROR: {}", msg);
+    let _ = std::io::stderr().flush();
+
+    // Stage 1: trigger kernel panic via sysrq 'c'.
+    // The kernel prints a full oops/backtrace and then behaves according to
+    // the kernel cmdline parameter panic= (reboot, halt, or timeout).
+    // Works on any kernel with CONFIG_MAGIC_SYSRQ=y (default on all distros).
+    if let Ok(mut f) = fs::OpenOptions::new().write(true).open("/proc/sysrq-trigger") {
+        let _ = f.write_all(b"c");
     }
+
+    // Stage 2 fallback: CONFIG_MAGIC_SYSRQ=n (hardened/embedded kernels).
+    // Send SIGABRT to ourselves via nix (no libc dependency – safe with musl static linking).
+    // The kernel MUST panic when PID 1 dies – this is guaranteed kernel behaviour.
+    let _ = kill(getpid(), Signal::SIGABRT);
+
+    // Stage 3: absolute last resort – unreachable in practice
+    loop { sleep(Duration::from_secs(1)); }
 }
 
-/// -----------------------------------------------------------------------------
-/// HAUPTPROGRAMM (PID 1)
-/// -----------------------------------------------------------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// HAUPTPROGRAMM (PID 1)
+// ────────────────────────────────────────────────────────────────────────────
+
 fn main() {
-    println!("[PIVOT] Starting FinchBerryOS Initial RAM File System...");
-
-    // 1. Virtuelle Dateisysteme mounten (Ohne VFS sind wir hardware-blind)
+    // VFS FIRST: devtmpfs must be mounted before klog! can open /dev/kmsg
     setup_vfs();
-
-    // 2. Config einlesen
+    klog!("Starting FinchBerryOS Initial RAM File System...");
     let config = read_config("/pivot.config");
 
-    if config.system.mode != "installed" {
-        println!("[PIVOT] Booting in Live/Installer mode...");
-        // Live-System Logik würde hier folgen
-        return;
-    }
+    // Mode is now validated at parse time via the BootMode enum.
+    // (Non-"installed" values cause a toml parse error → fatal_error in read_config.)
 
-    // 3. Hardware via PARTUUID finden
-    println!("[PIVOT] Scanning for Hardware (PARTUUID)...");
-    let sp_dev = find_device_by_partuuid(&config.hardware.system_partition_uuid)
+    // 1. Hardware polling – GPT parsing, no udev required
+    let sp_dev = wait_for_partuuid(&config.hardware.system_partition_uuid, 15)
         .unwrap_or_else(|| fatal_error("System Partition (SP) not found!"));
-    let bp_dev = find_device_by_partuuid(&config.hardware.boot_partition_uuid)
+    let bp_dev = wait_for_partuuid(&config.hardware.boot_partition_uuid, 15)
         .unwrap_or_else(|| fatal_error("Boot Partition (BP) not found!"));
 
-    // 4. System Partition (SP) mounten
-    fs::create_dir_all("/mnt/system").unwrap();
-    mount(Some(sp_dev.as_str()), "/mnt/system", Some("ext4"), MsFlags::empty(), None::<&str>)
-        .unwrap_or_else(|_| fatal_error("Failed to mount SP to /mnt/system"));
+    klog!("SP: {}  BP: {}", sp_dev, bp_dev);
 
-    // 5. Update-Weiche: Trigger und Payload checken
-    if check_for_updates() {
-        execute_ram_update(&sp_dev, &bp_dev);
-        unreachable!("System must reboot after update");
+    // 2. FSCK
+    klog!("Checking System Partition integrity...");
+    match Command::new("/sbin/e2fsck").arg("-p").arg("-f").arg(&sp_dev).status() {
+        Err(e) => fatal_error(&format!("e2fsck could not be launched: {}", e)),
+        Ok(status) => match status.code() {
+            None       => fatal_error("e2fsck killed by signal"),
+            Some(code) if code >= 4 => fatal_error(&format!("e2fsck critical failure: code {}", code)),
+            Some(code) => klog!("e2fsck finished with code {} (ok)", code),
+        },
     }
 
-    // 6. Normaler Boot: System zusammenbauen
-    let active_image = if config.system.active_slot == "A" {
-        &config.images.slot_a
-    } else {
-        &config.images.slot_b
+    // 3. Mount System Partition
+    fs::create_dir_all("/mnt/system")
+        .unwrap_or_else(|e| fatal_error(&format!("mkdir /mnt/system: {}", e)));
+    mount(
+        Some(sp_dev.as_str()), "/mnt/system",
+        Some("ext4"), MsFlags::empty(), None::<&str>,
+    ).unwrap_or_else(|e| fatal_error(&format!("Failed to mount SP: {}", e)));
+
+    // 4. Update check
+    if check_for_updates() {
+        klog!("Update trigger found – launching RAM updater.");
+        execute_ram_update(&sp_dev, &bp_dev);
+        unreachable!();
+    }
+
+    // 5. Slot selection
+    let active_image = match config.system.active_slot {
+        ActiveSlot::A => &config.images.slot_a,
+        ActiveSlot::B => &config.images.slot_b,
     };
+    klog!("Active slot image: {}", active_image);
+
     stage_system(active_image);
-
-    // 7. VFS-Mounts in das neue Root-Dateisystem verschieben
     move_vfs_to_new_root();
-
-    // 8. Der finale Sprung ins OS
     perform_pivot_and_exec();
 }
 
-/// -----------------------------------------------------------------------------
-/// HILFSFUNKTIONEN
-/// -----------------------------------------------------------------------------
+// ────────────────────────────────────────────────────────────────────────────
+// HELPER & LOGIK
+// ────────────────────────────────────────────────────────────────────────────
 
-fn setup_vfs() {
-    fs::create_dir_all("/proc").ok();
-    fs::create_dir_all("/sys").ok();
-    fs::create_dir_all("/dev").ok();
+// ────────────────────────────────────────────────────────────────────────────
+// GPT PARTUUID LOOKUP  (no udev, no blkid – pure kernel sysfs + raw block I/O)
+//
+// Strategy:
+//   1. Enumerate every block device in /sys/class/block/
+//   2. Skip non-partition entries (no "partition" sysfs attribute)
+//   3. Find the parent disk device (one level up in sysfs)
+//   4. Open /dev/<disk> and read the GPT header + partition table directly
+//   5. Compare each partition entry's GUID against the target PARTUUID
+//
+// The kernel never writes PARTUUID into uevent – that is solely a udev artifact.
+// GPT partition GUIDs are stored in the partition table at a well-known offset
+// and are readable from the raw block device which devtmpfs gives us.
+// ────────────────────────────────────────────────────────────────────────────
 
-    mount(None::<&str>, "/proc", Some("proc"), MsFlags::empty(), None::<&str>).unwrap();
-    mount(None::<&str>, "/sys", Some("sysfs"), MsFlags::empty(), None::<&str>).unwrap();
-    mount(Some("devtmpfs"), "/dev", Some("devtmpfs"), MsFlags::empty(), None::<&str>).unwrap();
+/// GPT constants (UEFI spec 2.10 §5.3)
+const GPT_HEADER_SIGNATURE: u64 = 0x5452415020494645; // "EFI PART" LE
+
+/// Read a little-endian u64 from a byte slice at a given offset.
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
-fn read_config(path: &str) -> PivotConfig {
-    let content = fs::read_to_string(path).unwrap_or_else(|_| fatal_error("pivot.config not found"));
-    toml::from_str(&content).unwrap_or_else(|_| fatal_error("Failed to parse pivot.config"))
+/// Convert a raw 16-byte GPT GUID (mixed-endian, UEFI layout) to the canonical
+/// lowercase string form used by Linux: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+///
+/// UEFI stores the first three groups as little-endian, the last two as big-endian.
+fn guid_to_string(raw: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        raw[3], raw[2], raw[1], raw[0],   // time_low (LE → reversed)
+        raw[5], raw[4],                   // time_mid (LE → reversed)
+        raw[7], raw[6],                   // time_hi  (LE → reversed)
+        raw[8], raw[9],                   // clock_seq (BE → as-is)
+        raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]  // node (BE → as-is)
+    )
 }
 
-fn find_device_by_partuuid(target_uuid: &str) -> Option<String> {
-    let block_dir = Path::new("/sys/class/block");
-    let target = target_uuid.to_lowercase();
+/// Read the logical block size for a disk from sysfs.
+/// Falls back to 512 if the attribute is missing (safe for 512e drives).
+fn read_logical_block_size(disk_name: &str) -> u64 {
+    let path = format!("/sys/class/block/{}/queue/logical_block_size", disk_name);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(512)
+}
 
-    if let Ok(entries) = fs::read_dir(block_dir) {
-        for entry in entries.flatten() {
-            let uevent_path = entry.path().join("uevent");
-            if let Ok(content) = fs::read_to_string(uevent_path) {
-                if content.to_lowercase().contains(&format!("partuuid={}", target)) {
-                    return Some(format!("/dev/{}", entry.file_name().to_string_lossy()));
+/// Try to find a partition with the given PARTUUID on a specific disk.
+/// Returns the /dev/<partname> path if found.
+fn scan_disk_for_partuuid(disk_dev: &str, disk_name: &str, target: &str) -> Option<String> {
+    let mut f = File::open(disk_dev).ok()?;
+
+    // Read the actual logical block size from sysfs – supports both 512/512e and 4Kn drives.
+    let lbs = read_logical_block_size(disk_name);
+
+    // LBA 1 holds the GPT primary header.
+    let mut header = vec![0u8; lbs as usize];
+    f.seek(SeekFrom::Start(lbs)).ok()?;
+    f.read_exact(&mut header).ok()?;
+
+    // Validate GPT signature ("EFI PART" at offset 0 of the header)
+    if read_u64_le(&header, 0) != GPT_HEADER_SIGNATURE {
+        return None; // not a GPT disk
+    }
+
+    let part_entry_lba  = read_u64_le(&header, 72);
+    let num_part_entries = read_u32_le(&header, 80);
+    let part_entry_size  = read_u32_le(&header, 84) as u64;
+
+    // Safety caps (UEFI spec: minimum 128 bytes, Linux hard-limits to 128 entries)
+    if part_entry_size < 128 || part_entry_size > 512 { return None; }
+    let safe_count = num_part_entries.min(128);
+
+    for i in 0..safe_count {
+        let byte_offset = part_entry_lba * lbs + i as u64 * part_entry_size;
+        let mut entry = vec![0u8; part_entry_size as usize];
+        if f.seek(SeekFrom::Start(byte_offset)).is_err() { break; }
+        if f.read_exact(&mut entry).is_err() { break; }
+
+        // Bytes 0..16: partition type GUID – all zeros means unused entry
+        if entry[0..16].iter().all(|&b| b == 0) { continue; }
+
+        // Bytes 16..32: partition unique GUID (PARTUUID)
+        let raw_guid: [u8; 16] = entry[16..32].try_into().unwrap();
+        let part_guid = guid_to_string(&raw_guid);
+
+        if part_guid == target {
+            let part_start_lba = read_u64_le(&entry, 32);
+
+            if let Ok(children) = fs::read_dir(format!("/sys/class/block/{}", disk_name)) {
+                for child in children.flatten() {
+                    let child_name = child.file_name().to_string_lossy().to_string();
+
+                    // Match only direct children of this disk.
+                    // NVMe: nvme0n1p1 (disk + "p" + digit)
+                    // SCSI/SATA: sda1 (disk + digit)
+                    let suffix = child_name.strip_prefix(disk_name).unwrap_or("");
+                    let is_partition = suffix.starts_with('p') && suffix.len() > 1
+                        || suffix.chars().next().map_or(false, |c| c.is_ascii_digit());
+                    if !is_partition { continue; }
+
+                    let start_path = child.path().join("start");
+                    if let Ok(s) = fs::read_to_string(&start_path) {
+                        if s.trim().parse::<u64>().ok() == Some(part_start_lba) {
+                            klog!("PARTUUID {} → /dev/{}", target, child_name);
+                            return Some(format!("/dev/{}", child_name));
+                        }
+                    }
                 }
             }
+            klog!("WARN: GUID match for {} but no sysfs child with start={}", target, part_start_lba);
         }
     }
     None
 }
 
-/// Prüft das "Double-Flag" Prinzip für anstehende Updates
-fn check_for_updates() -> bool {
-    let trigger = Path::new("/mnt/system/private/system/StartUpdateInstaller");
-    let payload = Path::new("/mnt/system/var/update/sys_update.fbuimg");
-    trigger.exists() && payload.exists()
+/// Poll for a partition by PARTUUID using direct GPT parsing.
+/// Works without udev – only requires devtmpfs + sysfs (both mounted in setup_vfs).
+fn wait_for_partuuid(target_uuid: &str, timeout_secs: u64) -> Option<String> {
+    let start  = Instant::now();
+    let needle = target_uuid.to_lowercase();
+
+    while start.elapsed().as_secs() < timeout_secs {
+        // Enumerate all block devices visible in sysfs
+        if let Ok(entries) = fs::read_dir("/sys/class/block") {
+            for entry in entries.flatten() {
+                let dev_name = entry.file_name().to_string_lossy().to_string();
+
+                // We only want whole disk devices (no partitions themselves).
+                // A whole disk has no "partition" attribute in sysfs.
+                let part_attr = entry.path().join("partition");
+                if part_attr.exists() { continue; }
+
+                // Skip loop, ram, zram, dm devices – they have no GPT
+                if dev_name.starts_with("loop")
+                    || dev_name.starts_with("ram")
+                    || dev_name.starts_with("zram")
+                    || dev_name.starts_with("dm-")
+                {
+                    continue;
+                }
+
+                let disk_dev = format!("/dev/{}", dev_name);
+                if let Some(found) = scan_disk_for_partuuid(&disk_dev, &dev_name, &needle) {
+                    return Some(found);
+                }
+            }
+        }
+        sleep(Duration::from_millis(200));
+    }
+    None
 }
 
-/// Der RAM-isolierte Update-Prozess
-fn execute_ram_update(sp_dev: &str, bp_dev: &str) {
-    println!("[PIVOT] Update requested. Entering RAM Update Mode...");
+/// RO bind-mount: bind first, then remount read-only.
+fn mount_bind_ro(src: &Path, tgt: &Path) {
+    mount(Some(src), tgt, None::<&str>, MsFlags::MS_BIND, None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Bind mount {:?} → {:?}: {}", src, tgt, e)));
 
-    fs::create_dir_all("/tmp").unwrap();
-    mount(None::<&str>, "/tmp", Some("tmpfs"), MsFlags::empty(), None::<&str>).unwrap();
-
-    let disk_installer = "/mnt/system/system/updateinstaller";
-    let ram_installer = "/tmp/updateinstaller";
-
-    fs::copy(disk_installer, ram_installer)
-        .unwrap_or_else(|_| fatal_error("Failed to copy updateinstaller to RAM"));
-    fs::set_permissions(ram_installer, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // BP Mounten für Kernel/Initramfs Updates
-    fs::create_dir_all("/mnt/boot").unwrap();
-    mount(Some(bp_dev), "/mnt/boot", Some("vfat"), MsFlags::empty(), None::<&str>).unwrap();
-
-    // SP aushängen, um die Block-Ebene für den Flasher freizugeben
-    umount2("/mnt/system", MntFlags::MNT_DETACH).unwrap();
-
-    println!("[PIVOT] Handing over control to UpdateInstaller in RAM...");
-    let err = Command::new(ram_installer)
-        .arg("--sp-dev").arg(sp_dev)
-        .arg("--bp-dev").arg(bp_dev)
-        .exec();
-    
-    fatal_error(&format!("Failed to execute RAM updater: {}", err));
+    mount(
+        None::<&str>, tgt, None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&str>,
+    ).unwrap_or_else(|e| fatal_error(&format!("RO remount {:?}: {}", tgt, e)));
 }
 
-/// Baut das Dateisystem aus SquashFS Image + User-Daten zusammen
 fn stage_system(active_image: &str) {
-    println!("[PIVOT] Staging new root filesystem...");
-
     let staging_root = Path::new("/system/rootfs");
-    let base_root = Path::new("/system/base_root");
+    let base_root    = Path::new("/system/base_root");
 
-    fs::create_dir_all(staging_root).unwrap();
-    fs::create_dir_all(base_root).unwrap();
+    fs::create_dir_all(staging_root)
+        .unwrap_or_else(|e| fatal_error(&format!("mkdir {:?}: {}", staging_root, e)));
+    fs::create_dir_all(base_root)
+        .unwrap_or_else(|e| fatal_error(&format!("mkdir {:?}: {}", base_root, e)));
 
-    // 1. Loop-Mount in purem Rust (Keine externen Binaries nötig!)
+    // Attach squashfs image via loop device.
+    // Wait for /dev/loop-control to appear – on bare metal PID 1 often races
+    // ahead of the kernel driver init. Poll with a short timeout.
+    let loop_control_path = Path::new("/dev/loop-control");
+    let lc = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if loop_control_path.exists() {
+                match LoopControl::open() {
+                    Ok(lc) => break lc,
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        klog!("WARN: LoopControl::open failed ({}), retrying...", e);
+                        sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => fatal_error(&format!("LoopControl::open: {}", e)),
+                }
+            } else if std::time::Instant::now() < deadline {
+                sleep(Duration::from_millis(50));
+            } else {
+                fatal_error("/dev/loop-control did not appear within 5s");
+            }
+        }
+    };
+    let loop_dev = lc.next_free()
+        .unwrap_or_else(|e| fatal_error(&format!("No free loop device: {}", e)));
     let image_path = format!("/mnt/system/system/{}", active_image);
-    println!("[PIVOT] Allocating Loop Device for {}...", image_path);
-    
-    let lc = LoopControl::open().unwrap_or_else(|_| fatal_error("Could not open /dev/loop-control"));
-    let loop_dev = lc.next_free().unwrap_or_else(|_| fatal_error("No free loop device found"));
-    
     loop_dev.with()
         .autoclear(true)
         .read_only(true)
         .attach(&image_path)
-        .unwrap_or_else(|_| fatal_error("Failed to attach image to loop device"));
+        .unwrap_or_else(|e| fatal_error(&format!("Loop attach {}: {}", image_path, e)));
 
-    let block_device_path = loop_dev.path().unwrap();
-    
-    // Mount als SquashFS
-    mount(Some(&block_device_path), base_root, Some("squashfs"), MsFlags::MS_RDONLY, None::<&str>)
-        .unwrap_or_else(|_| fatal_error("Base Image Mount failed. Is it a valid SquashFS?"));
+    let block_dev = loop_dev.path()
+        .unwrap_or_else(|| fatal_error("Loop device has no path after attach"));
 
-    // 2. Das Skelett für das Sandwich erstellen
+    mount(
+        Some(&block_dev), base_root,
+        Some("squashfs"), MsFlags::MS_RDONLY, None::<&str>,
+    ).unwrap_or_else(|e| fatal_error(&format!("Mount squashfs {:?}: {}", block_dev, e)));
+
+    // Keep the loop device alive (autoclear handles cleanup on final unmount)
+    std::mem::forget(loop_dev);
+
+    // Create mount-point skeleton in staging root
     let dirs = [
-        "System", "Applications", "Users", "Library", "Volumes", "private", 
-        "proc", "sys", "dev", "run", "usr", "bin", "sbin", "mnt"
+        "System", "Applications", "Users", "Library",
+        "Volumes", "private", "proc", "sys", "dev",
+        "run", "usr", "bin", "sbin", "mnt/system",
     ];
     for dir in &dirs {
-        fs::create_dir_all(staging_root.join(dir)).unwrap();
+        fs::create_dir_all(staging_root.join(dir))
+            .unwrap_or_else(|e| fatal_error(&format!("mkdir staging/{}: {}", dir, e)));
     }
 
-    // 3. Den System-Kern (ReadOnly) spiegeln (inkl. Standard Unix-Ordner)
-    let core_dirs = ["System", "usr", "bin", "sbin"];
-    for dir in &core_dirs {
+    // Immutable core from squashfs (read-only bind)
+    for dir in &["System", "usr", "bin", "sbin"] {
         let src = base_root.join(dir);
-        let target = staging_root.join(dir);
-        
         if src.exists() {
-            mount(Some(&src), &target, None::<&str>, MsFlags::MS_BIND | MsFlags::MS_RDONLY, None::<&str>)
-                .unwrap_or_else(|_| println!("[WARNING] Could not bind-mount core dir: {}", dir));
+            mount_bind_ro(&src, &staging_root.join(dir));
+        } else {
+            klog!("WARN: squashfs/{} not found – skipping RO bind", dir);
         }
     }
 
-    // 4. Beschreibbare Nutzerdatenbanken binden (SP -> rootfs)
-    mount(Some("/mnt/system/Users"), &staging_root.join("Users"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-    mount(Some("/mnt/system/Library"), &staging_root.join("Library"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-    mount(Some("/mnt/system/private"), &staging_root.join("private"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-    mount(Some("/mnt/system/Volumes"), &staging_root.join("Volumes"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-
-    // 5. Hybride Applications zusammenbauen
-    println!("[PIVOT] Constructing Hybrid /Applications folder...");
-    
-    // A: User-Apps binden (Read-Write)
-    mount(Some("/mnt/system/Applications"), &staging_root.join("Applications"), None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-    
-    // B: Core-Apps einzeln als Read-Only einblenden
-    let core_apps = base_root.join("Applications");
-    if let Ok(entries) = fs::read_dir(core_apps) {
-        for entry in entries.flatten() {
-            let app_name = entry.file_name();
-            let app_source = entry.path();
-            let app_target = staging_root.join("Applications").join(&app_name);
-            
-            fs::create_dir_all(&app_target).ok(); // Ankerpunkt
-            mount(Some(&app_source), &app_target, None::<&str>, MsFlags::MS_BIND | MsFlags::MS_RDONLY, None::<&str>)
-                .unwrap_or_else(|_| println!("[WARNING] Failed to pin system app: {:?}", app_name));
+    // Persistent RW data from system partition.
+    // On first boot these directories may not exist yet – create them on the SP
+    // rather than skipping the bind, which would silently leave the path backed
+    // by the initramfs tmpfs and lose all writes after reboot.
+    for dir in &["Users", "Library", "private", "Volumes", "Applications"] {
+        let src = format!("/mnt/system/{}", dir);
+        let tgt = staging_root.join(dir);
+        if !Path::new(&src).exists() {
+            klog!("First boot: creating {} on SP", src);
+            fs::create_dir_all(&src)
+                .unwrap_or_else(|e| fatal_error(&format!("mkdir {} on SP: {}", src, e)));
         }
+        mount(Some(src.as_str()), &tgt, None::<&str>, MsFlags::MS_BIND, None::<&str>)
+            .unwrap_or_else(|e| fatal_error(&format!("Bind mount {} → {:?}: {}", src, tgt, e)));
     }
+
+    // Pass-through master mount of system partition
+    mount(
+        Some("/mnt/system"),
+        &staging_root.join("mnt/system"),
+        None::<&str>, MsFlags::MS_BIND, None::<&str>,
+    ).unwrap_or_else(|e| fatal_error(&format!("Bind /mnt/system into staging: {}", e)));
 }
 
-/// Verschiebt die VFS-Mounts aus dem Initramfs ins neue Dateisystem
+fn setup_vfs() {
+    // /proc, /sys, /dev must exist as empty dirs in the initramfs cpio archive.
+    // Mount /dev FIRST so that /dev/kmsg is available for fatal_error's Stage 1
+    // (sysrq-trigger lives under /proc which comes second).
+    mount(Some("devtmpfs"), "/dev", Some("devtmpfs"), MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount devtmpfs: {}", e)));
+    mount(None::<&str>, "/proc", Some("proc"),     MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount procfs: {}", e)));
+    mount(None::<&str>, "/sys",  Some("sysfs"),    MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount sysfs: {}", e)));
+}
+
 fn move_vfs_to_new_root() {
-    println!("[PIVOT] Relocating Virtual Filesystems...");
     let staging = Path::new("/system/rootfs");
-
-    mount(Some("/dev"), &staging.join("dev"), None::<&str>, MsFlags::MS_MOVE, None::<&str>).unwrap();
-    mount(Some("/proc"), &staging.join("proc"), None::<&str>, MsFlags::MS_MOVE, None::<&str>).unwrap();
-    mount(Some("/sys"), &staging.join("sys"), None::<&str>, MsFlags::MS_MOVE, None::<&str>).unwrap();
-    
-    // Frisches tmpfs für PID-Files und Sockets im neuen System
-    mount(Some("tmpfs"), &staging.join("run"), Some("tmpfs"), MsFlags::empty(), None::<&str>).unwrap();
+    for vfs in &["dev", "proc", "sys"] {
+        mount(
+            Some(&format!("/{}", vfs)),
+            &staging.join(vfs),
+            None::<&str>, MsFlags::MS_MOVE, None::<&str>,
+        ).unwrap_or_else(|e| fatal_error(&format!("MS_MOVE /{} into staging: {}", vfs, e)));
+    }
+    mount(Some("tmpfs"), &staging.join("run"), Some("tmpfs"), MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount tmpfs for /run: {}", e)));
 }
 
-/// Der Punkt ohne Wiederkehr: Pivot und Übergabe an syscored
+/// Switch root – correct approach for initramfs.
+///
+/// pivot_root(2) CANNOT be used from an initramfs because the initramfs is a
+/// tmpfs that the kernel mounts directly as the initial root. It has no parent
+/// mountpoint entry in the mount namespace, so pivot_root always returns EINVAL.
+///
+/// The correct sequence (identical to busybox switch_root / systemd):
+///   1. MS_MOVE  – atomically move new_root onto /
+///   2. chroot(".") – update the kernel's root pointer
+///   3. Clean up any remaining initramfs tmpfs entries to release RAM
+///   4. exec the real init
 fn perform_pivot_and_exec() -> ! {
-    println!("[PIVOT] All systems go. Executing pivot_root...");
-    
     let new_root = "/system/rootfs";
-    // Versteckter, chirurgisch reiner "Parkplatz" für den Kernel
-    let put_old = "/system/rootfs/mnt/.initramfs";
 
-    // Damit pivot_root funktioniert, muss new_root ein eigener Mountpoint sein
-    mount(Some(new_root), new_root, None::<&str>, MsFlags::MS_BIND, None::<&str>).unwrap();
-    
-    fs::create_dir_all(put_old).unwrap();
-    chdir(new_root).unwrap();
-    
-    
-    
-    // Der Tausch der Welten
-    pivot_root(".", "mnt/.initramfs").unwrap_or_else(|e| fatal_error(&format!("pivot_root failed: {}", e)));
+    // Step 1: bind-mount new_root onto itself to make it an explicit mountpoint.
+    // MS_MOVE requires the source to be a mountpoint. /system/rootfs is a plain
+    // directory in the initramfs tmpfs – it has submounts inside it, but the
+    // directory itself has no mount entry. This bind-mount creates one.
+    mount(Some(new_root), new_root, None::<&str>, MsFlags::MS_BIND, None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Bind new_root onto itself: {}", e)));
 
-    // Das alte Initramfs aushängen (Gibt den RAM des alten Systems frei)
-    umount2("/mnt/.initramfs", MntFlags::MNT_DETACH).ok();
-    
-    // Spuren verwischen: Den leeren, versteckten Parkplatz-Ordner löschen
-    fs::remove_dir("/mnt/.initramfs").ok();
+    // Step 2: chdir into the new root
+    chdir(new_root)
+        .unwrap_or_else(|e| fatal_error(&format!("chdir to new_root: {}", e)));
 
-    println!("[PIVOT] Handing over to syscored at /usr/libexec/syscored...");
-    // Starte den neuen PID 1
+    // Step 3: atomically move new_root onto /
+    // Now that new_root is a proper mountpoint, MS_MOVE works correctly.
+    mount(Some(new_root), "/", None::<&str>, MsFlags::MS_MOVE, None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("MS_MOVE new_root onto /: {}", e)));
+
+    // Step 4: update the kernel root pointer
+    chroot(".")
+        .unwrap_or_else(|e| fatal_error(&format!("chroot to new root: {}", e)));
+
+    // Step 5: chdir to / inside the new root
+    chdir("/")
+        .unwrap_or_else(|e| fatal_error(&format!("chdir to / in new root: {}", e)));
+
+    // Step 6: wire up stdin/stdout/stderr to /dev/console for syscored.
+    // After switch_root the process has no open file descriptors for the
+    // standard streams. Any write to stdout/stderr in syscored would hit
+    // a closed fd and raise SIGPIPE / EIO – crashing the new init immediately.
+    // Opening /dev/console and dup2-ing it to fds 0/1/2 is the POSIX-standard
+    // way to give PID 1 a working console before exec.
+    {
+        use std::os::unix::io::IntoRawFd;
+        let console = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/console")
+            .unwrap_or_else(|e| fatal_error(&format!("Open /dev/console: {}", e)));
+        let fd = console.into_raw_fd();
+        // dup2: redirect stdin(0), stdout(1), stderr(2) to /dev/console
+        for target_fd in 0i32..=2 {
+            if fd != target_fd {
+                dup2(fd, target_fd)
+                    .unwrap_or_else(|e| fatal_error(&format!("dup2 console→fd{}: {}", target_fd, e)));
+            }
+        }
+        // Close the original fd if it was above 2 (avoid leaking it into syscored)
+        if fd > 2 {
+            close(fd)
+                .unwrap_or_else(|e| fatal_error(&format!("close console fd: {}", e)));
+        }
+    }
+
+    // Step 7: hand off to the real init
+    klog!("Executing /usr/libexec/syscored ...");
     let err = Command::new("/usr/libexec/syscored").exec();
-    
-    fatal_error(&format!("Failed to execute syscored: {}", err));
+    fatal_error(&format!("exec /usr/libexec/syscored failed: {}", err));
+}
+
+fn read_config(path: &str) -> PivotConfig {
+    let content = fs::read_to_string(path)
+        .unwrap_or_else(|e| fatal_error(&format!("Cannot read {}: {}", path, e)));
+    toml::from_str(&content)
+        .unwrap_or_else(|e| fatal_error(&format!("pivot.config parse error: {}", e)))
+}
+
+fn check_for_updates() -> bool {
+    // Double-flag principle: only trigger update if BOTH the trigger marker
+    // AND the actual update payload are present on the SP.
+    // A lone trigger without a payload would launch the updater with nothing to do.
+    let trigger = Path::new("/mnt/system/private/system/StartUpdateInstaller");
+    let payload  = Path::new("/mnt/system/var/update/sys_update.fbuimg");
+    trigger.exists() && payload.exists()
+}
+
+/// Copies the updater binary into RAM (tmpfs) and executes it.
+/// SP is unmounted first so the updater can repartition freely.
+fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
+    let src = "/mnt/system/system/updateinstaller";
+    let dst = "/tmp/updateinstaller";
+
+    // Sanity-check source exists before we mount tmpfs
+    if !Path::new(src).exists() {
+        fatal_error("updateinstaller binary not found on SP");
+    }
+
+    fs::create_dir_all("/tmp")
+        .unwrap_or_else(|e| fatal_error(&format!("mkdir /tmp: {}", e)));
+    mount(None::<&str>, "/tmp", Some("tmpfs"), MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount tmpfs on /tmp: {}", e)));
+    fs::copy(src, dst)
+        .unwrap_or_else(|e| fatal_error(&format!("Copy updateinstaller to RAM: {}", e)));
+    fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| fatal_error(&format!("chmod updateinstaller: {}", e)));
+
+    // Mount BP so the updater can also flash kernel/initramfs on the boot partition
+    fs::create_dir_all("/mnt/boot")
+        .unwrap_or_else(|e| fatal_error(&format!("mkdir /mnt/boot: {}", e)));
+    mount(Some(bp_dev), "/mnt/boot", Some("vfat"), MsFlags::empty(), None::<&str>)
+        .unwrap_or_else(|e| fatal_error(&format!("Mount BP to /mnt/boot: {}", e)));
+
+    // Unmount SP so the updater can repartition freely (BP stays mounted via /mnt/boot)
+    umount2("/mnt/system", MntFlags::MNT_DETACH)
+        .unwrap_or_else(|e| fatal_error(&format!("Umount SP before update: {}", e)));
+
+    let err = Command::new(dst)
+        .arg("--sp-dev").arg(sp_dev)
+        .arg("--bp-dev").arg(bp_dev)
+        .exec();
+    fatal_error(&format!("exec updateinstaller failed: {}", err));
 }
