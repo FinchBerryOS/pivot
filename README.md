@@ -1,75 +1,75 @@
 # pivot — FinchBerryOS initramfs
 **The first process. The last line of defense.**
 
-`pivot` ist das PID 1 Init-Binary, das fest im FinchBerryOS-Initramfs integriert ist. Es wurde vollständig in **Rust** geschrieben und ist dafür verantwortlich, das finale Root-Dateisystem aus einem schreibgeschützten **SquashFS-Image** und den persistenten Nutzerdaten zusammenzusetzen, bevor es die Kontrolle an `syscored` übergibt.
+`pivot` is the PID 1 init binary embedded in the FinchBerryOS initramfs. Written entirely in **Rust**, it is responsible for assembling the final root filesystem from a read-only **SquashFS image** and persistent user data before handing control over to `syscored`.
 
 ---
 
-## Übersicht
-Moderne Linux-Systeme booten in eine minimale RAM-basierte Umgebung (Initramfs), bevor sie zum echten Root-Dateisystem wechseln. `pivot` ist das Herzstück dieser Umgebung.
+## Overview
+Modern Linux systems boot into a minimal RAM-based environment (initramfs) before transitioning to the real root filesystem. `pivot` is the heart of this environment.
 
-Es führt die gesamte Boot-Sequenz in einem einzigen, deterministischen Durchlauf aus:
+It performs the entire boot sequence in a single, deterministic pass:
 
-1. **Kernel lädt Initramfs**
+1. **Kernel loads initramfs**
    └── **pivot (PID 1)**
-       ├── Mountet virtuelle Dateisysteme (`/proc`, `/sys`, `/dev`)
-       ├── Liest `pivot.config` (TOML)
-       ├── Lokalisiert Partitionen via **PARTUUID**
-       ├── Mountet die **System Partition (SP)** nach `/mnt/system`
-       ├── [Optional] Wechselt in den **RAM Update Mode**
-       ├── Erstellt das Root-Dateisystem-"Sandwich" unter `/system/rootfs`
-       ├── Verschiebt VFS-Mounts in das neue Root
+       ├── Mount virtual filesystems (`/proc`, `/sys`, `/dev`)
+       ├── Read `pivot.config` (TOML)
+       ├── Locate partitions via **PARTUUID**
+       ├── Mount the **System Partition (SP)** to `/mnt/system`
+       ├── [Optional] Enter **RAM Update Mode**
+       ├── Create the root filesystem "sandwich" at `/system/rootfs`
+       ├── Relocate VFS mounts to the new root
        ├── `pivot_root(2)`
-       └── `exec /usr/libexec/syscored` → Neuer PID 1
+       └── `exec /usr/libexec/syscored` → New PID 1
 
 ---
 
-## Boot-Modi
+## Boot Modes
 
 ### Normal Boot
-Der Standardpfad. `pivot` mountet das aktive A/B-Slot-Image (SquashFS), verbindet es mit den persistenten Ordnern der SP (Users, Library, private) und "pivoted" in das Resultat.
+The standard path. `pivot` mounts the active A/B slot image (SquashFS), connects it with the persistent folders on the SP (`Users`, `Library`, `private`), and "pivots" into the resulting structure.
 
 ### Live / Installer Mode
-Wenn `pivot.config` den Wert `mode = "live"` enthält, wird der normale Bootpfad übersprungen. Dies ist für Installationsmedien vorgesehen, um das System direkt aus dem RAM oder vom USB-Stick zu installieren.
+If `pivot.config` contains the value `mode = "live"`, the normal boot path is skipped. This is intended for installation media, allowing the system to be installed directly from RAM or a USB stick.
 
 ### RAM Update Mode
-Wird durch einen "Double-Flag"-Check ausgelöst:
-1. `/mnt/system/private/system/StartUpdateInstaller` (Trigger-Datei)
-2. `/mnt/system/var/update/sys_update.fbuimg` (Update-Payload)
+Triggered by a "double-flag" check:
+1. `/mnt/system/private/system/StartUpdateInstaller` (Trigger file)
+2. `/mnt/system/var/update/sys_update.fbuimg` (Update payload)
 
-Wenn beide vorhanden sind, kopiert `pivot` den `updateinstaller` in ein `tmpfs` im RAM, hängt die System-Partition aus (um dem Flasher direkten Block-Zugriff zu geben) und führt den Updater vollständig im RAM aus. Dies ermöglicht atomare, sichere In-Place-System-Updates ohne Beeinträchtigung des laufenden Systems.
+If both exist, `pivot` copies the `updateinstaller` into a `tmpfs` in RAM, unmounts the System Partition (to grant the flasher raw block access), and executes the updater entirely from RAM. This enables atomic, safe in-place system updates without affecting the running system.
 
 ---
 
-## Dateisystem-Architektur
-`pivot` konstruiert ein geschichtetes Dateisystem-Sandwich unter `/system/rootfs`:
+## Filesystem Architecture
+`pivot` constructs a layered "sandwich" filesystem at `/system/rootfs`:
 
-| Mount-Punkt | Quelle | Modus | Beschreibung |
+| Mount Point | Source | Mode | Description |
 | :--- | :--- | :--- | :--- |
-| `/System`, `/usr`, `/bin`, `/sbin` | SquashFS Image | **RO** | Unveränderlicher System-Kern |
-| `/Applications/<CoreApp.app>` | SquashFS Image | **RO** | System-Apps (Finder, Terminal, etc.) |
-| `/Applications` | System Partition | **RW** | Ort für Nutzer-installierte Programme |
-| `/Users` | System Partition | **RW** | Home-Verzeichnisse der Benutzer |
-| `/Library` | System Partition | **RW** | Persistente Anwendungsdaten & Frameworks |
-| `/private` | System Partition | **RW** | Konfigurationen (`/etc`) und Daten (`/var`) |
-| `/Volumes` | System Partition | **RW** | **Zentraler Einhängepunkt für externe Medien** |
-| `/run` | `tmpfs` | **RW** | Flüchtige Daten (PIDs, Sockets) |
+| `/System`, `/usr`, `/bin`, `/sbin` | SquashFS Image | **RO** | Immutable System Core |
+| `/Applications/<CoreApp.app>` | SquashFS Image | **RO** | System Apps (Finder, Terminal, etc.) |
+| `/Applications` | System Partition | **RW** | Location for user-installed programs |
+| `/Users` | System Partition | **RW** | User home directories |
+| `/Library` | System Partition | **RW** | Persistent app data & frameworks |
+| `/private` | System Partition | **RW** | Configs (`/etc`) and Data (`/var`) |
+| `/Volumes` | System Partition | **RW** | **Central mount point for external media** |
+| `/run` | `tmpfs` | **RW** | Volatile data (PIDs, sockets) |
 
-### Der `/Volumes` Ordner
-Im Gegensatz zu anderen Systemordnern enthält `/Volumes` keine permanenten Daten. Er dient als dynamischer Einhängepunkt. Der Ankerpunkt liegt physisch auf der **System Partition**, damit das System dort jederzeit Unterordner für externe Laufwerke (z. B. USB-Sticks) erstellen kann, ohne das schreibgeschützte Haupt-Image verändern zu müssen.
+### The `/Volumes` Folder
+Unlike other system folders, `/Volumes` does not contain permanent data. It serves as a dynamic mount point. The anchor point is physically located on the **System Partition**, allowing the system to create subdirectories for external drives (e.g., USB sticks) at any time without modifying the read-only main image.
 
-### Der hybride `/Applications` Ordner
-Nutzer-Apps liegen beschreibbar auf der SP. System-Apps aus dem SquashFS-Image werden einzeln als Read-Only Bind-Mounts in diesen Ordner "gepinnt", um sie vor Manipulation zu schützen.
+### The Hybrid `/Applications` Folder
+User apps are located on the writable SP. System apps from the SquashFS image are individually "pinned" into this folder as read-only bind mounts to protect them from manipulation.
 
 ---
 
-## Konfiguration
-`pivot` erwartet eine `/pivot.config` im Root des Initramfs.
+## Configuration
+`pivot` expects a `/pivot.config` file in the root of the initramfs.
 
 ```toml
 [system]
-mode = "installed"   # "installed" oder "live"
-active_slot = "A"    # Aktueller Slot: "A" oder "B"
+mode = "installed"   # "installed" or "live"
+active_slot = "A"    # Current slot: "A" or "B"
 
 [hardware]
 boot_partition_uuid   = "XXXX-XXXX"
