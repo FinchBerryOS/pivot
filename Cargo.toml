@@ -1,0 +1,13 @@
+[package]
+name = "pivot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Systemaufrufe für Mounts und Exec
+nix = { version = "0.27.1", features = ["mount", "fs"] }
+# Parsing der pivot.config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+# Direkte Kommunikation mit dem Kernel für Loop-Devices (Pure Rust)
+loopdev = "0.4.0"
