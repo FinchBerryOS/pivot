@@ -140,7 +140,7 @@ struct ImagesConfig {
 impl ImagesConfig {
     /// Return all (name, path) slot pairs.
     ///
-    /// FIX #5: Centralises slot enumeration so that adding slot_c only requires
+    /// Centralises slot enumeration so that adding slot_c only requires
     /// updating this method and the ImagesConfig struct. Both validate_images()
     /// and any future caller that iterates slots consume this method – there is
     /// no second place to forget when the slot list grows.
@@ -245,14 +245,7 @@ fn main() {
         Some("ext4"), MsFlags::empty(), None::<&str>,
     ).unwrap_or_else(|e| fatal_error(&format!("Failed to mount SP: {}", e)));
 
-    // 4. Update check
-    if check_for_updates() {
-        klog!("Update trigger found – launching RAM updater.");
-        execute_ram_update(&sp_dev, &bp_dev);
-        unreachable!();
-    }
-
-    // 5. Slot selection
+    // 4. Slot selection
     let active_image = match config.system.active_slot {
         ActiveSlot::A => &config.images.slot_a,
         ActiveSlot::B => &config.images.slot_b,
@@ -269,7 +262,19 @@ fn main() {
     }
     klog!("Active slot image: {}", active_image);
 
-    stage_system(active_image);
+    // 5. Mount active slot image (SquashFS via loop device → /system/base_root).
+    // stage_system() returns the loop device path so execute_ram_update() can
+    // unmount the squashfs and release the loop device before exec'ing the updater.
+    let loop_dev_path = stage_system(active_image);
+
+    // 6. Update check – must run AFTER the active slot is mounted so the
+    // updateinstaller binary can be read from the active rootfs (/system/base_root).
+    if check_for_updates() {
+        klog!("Update trigger found – launching RAM updater.");
+        execute_ram_update(&sp_dev, &bp_dev, &loop_dev_path);
+        unreachable!();
+    }
+
     move_vfs_to_new_root();
     perform_pivot_and_exec();
 }
@@ -287,7 +292,7 @@ fn main() {
 //   3. Find the parent disk device (one level up in sysfs)
 //   4. Open /dev/<disk> and read the GPT primary header + partition table
 //   5. Compare each partition entry's GUID against the target PARTUUID
-//   6. FIX #4: If the primary header is corrupt/missing, fall back to the
+//   6. If the primary header is corrupt/missing, fall back to the
 //      GPT backup header at the last LBA (UEFI spec §5.3 requirement).
 //
 // The kernel never writes PARTUUID into uevent – that is solely a udev artifact.
@@ -409,6 +414,25 @@ fn scan_gpt_header_for_partuuid(
 
     let mut entry = vec![0u8; part_entry_size as usize];
 
+    // CRITICAL FIX #2: Validate part_entry_lba against the actual disk size
+    // before entering the scan loop. A corrupt GPT header (primary or backup)
+    // can contain an arbitrarily large part_entry_lba. Without this check,
+    // scan_gpt_header_for_partuuid would execute up to MAX_PARTITION_ENTRIES
+    // iterations, each issuing a seek+read that immediately fails with EINVAL
+    // or EIO. On slow storage (eMMC, SD) those 128 failing syscalls add
+    // measurable latency to every disk that has a corrupt header during the
+    // wait_for_partuuid polling loop.
+    //
+    // If the disk size is unavailable from sysfs we skip the check and proceed:
+    // the worst case is the same 128 failed seeks we had before – no regression.
+    if let Some(disk_lba) = read_disk_size_in_lba(disk_name, lbs) {
+        if part_entry_lba >= disk_lba {
+            klog!("WARN: GPT part_entry_lba {} beyond disk size {} LBAs on {}, skipping",
+                  part_entry_lba, disk_lba, disk_name);
+            return None;
+        }
+    }
+
     let array_base = match part_entry_lba.checked_mul(lbs) {
         Some(v) => v,
         None => {
@@ -472,7 +496,7 @@ fn scan_gpt_header_for_partuuid(
     None
 }
 
-/// FIX #4: Attempt to read the GPT backup header from the last LBA.
+/// Attempt to read the GPT backup header from the last LBA.
 ///
 /// The UEFI spec (§5.3) requires an identical backup GPT header at the very
 /// last LBA of the disk. gdisk, parted, and sgdisk all write it unconditionally.
@@ -523,8 +547,8 @@ fn scan_disk_for_partuuid(
     f.seek(SeekFrom::Start(lbs)).ok()?;
     f.read_exact(&mut header).ok()?;
 
-    // FIX #4: If the primary GPT signature is absent, fall back to the backup
-    // header at the last LBA before giving up on this disk. If the scan of the
+    // If the primary GPT signature is absent, fall back to the backup header
+    // at the last LBA before giving up on this disk. If the scan of the
     // primary header returns None (GUID absent from a valid table), we do NOT
     // fall back – the tables are identical and scanning twice is redundant noise.
     if read_u64_le(&header, 0)? != GPT_HEADER_SIGNATURE {
@@ -584,7 +608,7 @@ fn wait_for_partuuid(target_uuid: &str, timeout_secs: u64) -> Option<String> {
             klog!("WARN: no disk devices visible in sysfs yet, waiting...");
         }
 
-        // FIX #3: Cap the sleep to the remaining timeout so the actual wall time
+        // Cap the sleep to the remaining timeout so the actual wall time
         // never significantly exceeds timeout_secs. Without this cap, a single
         // scan pass on a system with many disks can take >200 ms, pushing the
         // total wait time well beyond timeout_secs and misleading the operator
@@ -609,7 +633,17 @@ fn mount_bind_ro(src: &Path, tgt: &Path) {
     ).unwrap_or_else(|e| fatal_error(&format!("RO remount {:?}: {}", tgt, e)));
 }
 
-fn stage_system(active_image: &str) {
+/// Mount the active slot image and set up the staging root.
+///
+/// Returns the path of the loop device (e.g. `/dev/loop0`) that backs the
+/// squashfs mount at `/system/base_root`. The caller must keep this path to
+/// pass to `execute_ram_update()` if an update is triggered – it is needed to
+/// unmount the squashfs and detach the loop device before exec'ing the updater.
+///
+/// For the normal (non-update) boot path the loop device stays alive via
+/// `autoclear`: the kernel releases it automatically when the last reference
+/// (the squashfs mount) is dropped, which happens implicitly after exec().
+fn stage_system(active_image: &str) -> std::path::PathBuf {
     let staging_root = Path::new("/system/rootfs");
     let base_root    = Path::new("/system/base_root");
 
@@ -662,7 +696,11 @@ fn stage_system(active_image: &str) {
         Some("squashfs"), MsFlags::MS_RDONLY, None::<&str>,
     ).unwrap_or_else(|e| fatal_error(&format!("Mount squashfs {:?}: {}", block_dev, e)));
 
-    // Keep the loop device alive (autoclear handles cleanup on final unmount)
+    // Capture the loop device path before forgetting the handle.
+    // Returned to the caller so execute_ram_update() can unmount squashfs and
+    // detach the loop device if an update is triggered.
+    // For the normal boot path autoclear releases the loop device after exec().
+    let loop_dev_path = block_dev.to_path_buf();
     std::mem::forget(loop_dev);
 
     let dirs = [
@@ -707,6 +745,8 @@ fn stage_system(active_image: &str) {
         &staging_root.join("mnt/system"),
         None::<&str>, MsFlags::MS_BIND, None::<&str>,
     ).unwrap_or_else(|e| fatal_error(&format!("Bind /mnt/system into staging: {}", e)));
+
+    loop_dev_path
 }
 
 fn setup_vfs() {
@@ -758,14 +798,24 @@ fn move_vfs_to_new_root() {
 /// of active mounts (/system, /mnt) are intentionally excluded: they are not
 /// themselves mountpoints but touching them would raise EBUSY.
 ///
-/// FIX #1 (v2): Use remove_dir_all instead of remove_dir so that non-empty
-/// directories (/usr, /bin, /lib, etc.) are actually freed rather than silently
-/// skipped with ENOTEMPTY. The active_mounts guard runs first to ensure we
-/// never recursively delete a real mountpoint subtree.
+/// CRITICAL FIX #1: Use remove_dir (not remove_dir_all) + remove_file fallback.
 ///
-/// FIX #2 (v2): Guard via /pivot.config sentinel to confirm "/" still addresses
-/// the old initramfs root before deleting anything. If the sentinel is missing,
-/// we bail out rather than risk corrupting the new root.
+/// remove_dir_all is dangerous here because it recurses into subdirectories
+/// and does NOT stop at mountpoints inside them. An initramfs /etc that happens
+/// to contain a bind-mount (e.g. /etc/resolv.conf) would have its mountpoint
+/// directory entry deleted by remove_dir_all even though the mount is still
+/// live in the kernel. The kernel mount remains but the path disappears,
+/// leaving the system in a subtly broken state that is hard to diagnose.
+///
+/// busybox switch_root and systemd avoid remove_dir_all for exactly this reason.
+/// We accept that non-empty directories (e.g. /usr with Busybox hardlinks) will
+/// not be freed at this stage – they will be released when the last reference
+/// to the initramfs tmpfs drops after exec(). The RAM saving from recursion is
+/// marginal (Busybox hardlinks share a single inode) and not worth the risk.
+///
+/// /pivot.config appears both as the sentinel check and in the candidates list.
+/// It MUST remain in candidates so it is deleted after the sentinel check passes;
+/// removing it from candidates would leave the file on the initramfs permanently.
 fn free_initramfs(active_mounts: &HashSet<String>) {
     // Sanity-check: /pivot.config must be visible via "/" to confirm we are
     // still addressing the old initramfs root (not the new one after chroot).
@@ -779,12 +829,17 @@ fn free_initramfs(active_mounts: &HashSet<String>) {
     }
 
     let candidates: &[&str] = &[
-        "/init",         // oder wie das Binary heißt
-        "/pivot.config",
+        "/init",
+        "/pivot.config", // sentinel – must stay in this list (see doc comment above)
+        "/dev",          // empty after MS_MOVE
+        "/proc",         // empty after MS_MOVE
+        "/sys",          // empty after MS_MOVE
+        "/bin",
         "/sbin",
-        "/dev",          // leer nach MS_MOVE
-        "/proc",         // leer nach MS_MOVE
-        "/sys",          // leer nach MS_MOVE
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/etc",
     ];
 
     for path_str in candidates {
@@ -795,12 +850,13 @@ fn free_initramfs(active_mounts: &HashSet<String>) {
         }
         let path = Path::new(path_str);
 
-        // FIX #1 (v2): remove_dir_all recurses into non-empty directories,
-        // freeing all initramfs files (Busybox, musl, etc.) rather than
-        // leaving them in place with a silent ENOTEMPTY.
-        // Fallback to remove_file handles plain files (/init, /pivot.config)
-        // and symlinks that remove_dir_all rejects.
-        let result = fs::remove_dir_all(path).or_else(|_| fs::remove_file(path));
+        // CRITICAL FIX #1: remove_dir for directories (fails safely with
+        // ENOTEMPTY if non-empty – no risk of crossing hidden mountpoints),
+        // remove_file fallback for plain files and symlinks.
+        // Non-empty dirs are skipped with a log entry; their pages will be
+        // reclaimed when the initramfs tmpfs reference count drops to zero
+        // after exec() replaces the process image.
+        let result = fs::remove_dir(path).or_else(|_| fs::remove_file(path));
         match result {
             Ok(_)  => klog!("free_initramfs: removed {}", path_str),
             Err(e) => klog!("free_initramfs: skipped {} ({})", path_str, e),
@@ -953,7 +1009,7 @@ fn validate_config(cfg: &PivotConfig) {
 
 /// Validate all image slot filenames in ImagesConfig.
 ///
-/// FIX #5: Iterates images.all_slots() instead of a hand-written array literal.
+/// Iterates images.all_slots() instead of a hand-written array literal.
 /// Adding slot_c to ImagesConfig and all_slots() automatically validates it here
 /// without any change to this function.
 fn validate_images(images: &ImagesConfig) {
@@ -983,54 +1039,177 @@ fn check_for_updates() -> bool {
     trigger.exists() && payload.exists()
 }
 
-/// Copies the updater binary into RAM (tmpfs) and executes it.
+/// Tear down every mount that references the active slot image, then detach
+/// the loop device.
 ///
-/// The Boot Partition (BP) is mounted at /mnt/boot so the updater can also
-/// flash kernel/initramfs. The System Partition (SP) is unmounted after the
-/// binary is copied so the updater can repartition freely.
+/// stage_system() builds the following mount tree from the active squashfs:
 ///
-/// --bp-mount (pre-mounted path) is passed instead of --bp-dev so the updater
-/// does not attempt a second mount() and fail with EBUSY.
-fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
-    let src = "/mnt/system/system/updateinstaller";
-    let dst = "/tmp/updateinstaller";
-
-    // Sanity-check source exists before we mount tmpfs
-    if !Path::new(src).exists() {
-        fatal_error("updateinstaller binary not found on SP");
+///   /dev/loopN  →  squashfs  →  /system/base_root   (RO squashfs mount)
+///                                      ├── System  →  bind →  /system/rootfs/System
+///                                      ├── usr     →  bind →  /system/rootfs/usr
+///                                      ├── bin     →  bind →  /system/rootfs/bin
+///                                      └── sbin    →  bind →  /system/rootfs/sbin
+///
+/// The bind mounts in /system/rootfs/* hold open references to the squashfs
+/// page cache. Unmounting only /system/base_root (even with MNT_DETACH) does
+/// NOT release the loop device while those bind mounts are still alive: the
+/// kernel maintains a reference count per block device, and each bind mount
+/// contributes one. The loop device will refuse LOOP_CTL_REMOVE (EBUSY) until
+/// all references are dropped.
+///
+/// Correct teardown order:
+///   1. Bind mounts from /system/rootfs/* first  (leaf nodes)
+///   2. /system/base_root squashfs               (intermediate)
+///   3. Loop device detach                        (root of the tree)
+///
+/// All bind-mount unmounts are fatal on failure: if any of them fails it means
+/// the kernel still holds a live reference to the squashfs, and proceeding
+/// would leave the updater trying to overwrite an image that is still in use.
+///
+/// The loop detach is also fatal. If all mounts above succeeded the loop device
+/// has no remaining references and LOOP_CTL_REMOVE must succeed. A failure at
+/// this point indicates an unexpected open fd (e.g. a kernel thread, or a bug
+/// in pivot) – proceeding with the update is unsafe because the .img file on
+/// the SP could be locked by the kernel's loop bookkeeping.
+/// autoclear does NOT rescue this: autoclear fires when the loop's internal
+/// reference count reaches zero, but that only happens after all mounts using
+/// it are gone AND no fd pointing at /dev/loopN is open. If we reach detach
+/// with an EBUSY, autoclear is also stuck.
+fn unmount_active_slot_mounts(loop_dev_path: &Path) {
+    // Step 1: unmount the bind mounts that read from the squashfs.
+    // These are the leaf nodes – they must go first.
+    // stage_system() skips a bind if the squashfs dir was absent (logs WARN),
+    // so the bind may not exist here. EINVAL from umount2 means "not a mount
+    // point" – that is the expected outcome for a skipped bind, so we log INFO
+    // and continue. Any other error means the kernel refused the unmount while
+    // the mount is still live → fatal.
+    let bind_mounts = [
+        "/system/rootfs/System",
+        "/system/rootfs/usr",
+        "/system/rootfs/bin",
+        "/system/rootfs/sbin",
+    ];
+    for mnt in &bind_mounts {
+        match umount2(*mnt, MntFlags::MNT_DETACH) {
+            Ok(_) => klog!("unmount_active_slot_mounts: unmounted bind {}", mnt),
+            Err(nix::errno::Errno::EINVAL) => {
+                // Not a mountpoint – stage_system() skipped this bind because
+                // the squashfs did not contain the directory. Safe to ignore.
+                klog!("INFO: unmount_active_slot_mounts: {} was not mounted (skipped bind), ok", mnt);
+            }
+            Err(e) => fatal_error(&format!(
+                "unmount_active_slot_mounts: failed to unmount bind {}: {} – \
+                 active slot image still referenced, aborting update",
+                mnt, e
+            )),
+        }
     }
 
+    // Step 2: unmount the squashfs itself.
+    // All bind mounts that consumed it are gone; this should succeed cleanly.
+    // MNT_DETACH: if pivot itself somehow has an open fd on base_root (unlikely
+    // but defensive), the detach makes the mountpoint unreachable immediately
+    // while the kernel waits for the last fd to close before freeing the pages.
+    umount2("/system/base_root", MntFlags::MNT_DETACH)
+        .unwrap_or_else(|e| fatal_error(&format!(
+            "unmount_active_slot_mounts: failed to unmount squashfs /system/base_root: {} – \
+             cannot safely release the active image",
+            e
+        )));
+    klog!("unmount_active_slot_mounts: unmounted squashfs /system/base_root");
+
+    // Step 3: detach the loop device.
+    // All mounts backed by this loop device are now gone (steps 1+2 were fatal
+    // on error), so the loop's reference count must be zero. LOOP_CTL_REMOVE
+    // must succeed. If it does not, something holds an unexpected reference
+    // (kernel thread, leaked fd in pivot, driver bug). Proceeding is unsafe:
+    // the updater would try to truncate/replace the .img file on the SP while
+    // the kernel still has it mapped through the loop device.
+    //
+    // This is intentionally fatal rather than a WARN+continue:
+    // autoclear is also stuck when EBUSY is returned here (see function doc),
+    // so "autoclear will handle it" is NOT a valid fallback in this context.
+    match loopdev::LoopDevice::open(loop_dev_path) {
+        Ok(ld) => {
+            ld.detach().unwrap_or_else(|e| fatal_error(&format!(
+                "unmount_active_slot_mounts: loop detach {:?} failed: {} – \
+                 all squashfs mounts are gone but the loop device is still busy; \
+                 aborting to prevent concurrent access to the slot image",
+                loop_dev_path, e
+            )));
+            klog!("unmount_active_slot_mounts: loop device {:?} detached", loop_dev_path);
+        }
+        Err(e) => fatal_error(&format!(
+            "unmount_active_slot_mounts: cannot open loop device {:?} for detach: {} – \
+             cannot verify the image is released",
+            loop_dev_path, e
+        )),
+    }
+}
+
+/// Copy the updateinstaller from the active rootfs into RAM and exec it.
+///
+/// Called only when check_for_updates() returns true, AFTER stage_system() has
+/// mounted the active slot image at /system/base_root.
+///
+/// Sequence:
+///   1. Mount /tmp as tmpfs (RAM-backed).
+///   2. Copy updateinstaller from the active rootfs (/system/base_root) to /tmp.
+///   3. Fully release the active slot image via unmount_active_slot_mounts():
+///      bind mounts → squashfs → loop device detach.
+///   4. The System Partition stays mounted at /mnt/system so the updater can
+///      read/write slot images and pivot.config without remounting.
+///   5. exec the updater from RAM with --sp-dev and --bp-dev.
+///
+/// The Boot Partition is NOT mounted here. The updater mounts it itself via
+/// --bp-dev when it needs to flash kernel/initramfs.
+fn execute_ram_update(sp_dev: &str, bp_dev: &str, loop_dev_path: &Path) -> ! {
+    // updateinstaller lives inside the active slot image.
+    // /system/base_root is the squashfs mount of the active slot.
+    let src = "/system/base_root/usr/libexec/updateinstaller";
+    let dst = "/tmp/updateinstaller";
+
+    if !Path::new(src).exists() {
+        fatal_error(&format!(
+            "updateinstaller not found in active rootfs at {} – \
+             image may be corrupt or the path has changed",
+            src
+        ));
+    }
+
+    // Step 1: mount /tmp as tmpfs so the binary survives the squashfs unmount.
+    // Tolerate EBUSY: /tmp may already be a tmpfs if we are resuming after a
+    // crash that left the mount in place. Any other error is fatal.
     fs::create_dir_all("/tmp")
        .unwrap_or_else(|e| fatal_error(&format!("mkdir /tmp: {}", e)));
-    // Tolerate EBUSY: /tmp may already be a tmpfs mountpoint if we are resuming
-    // after a crash. Any other error is fatal.
     match mount(None::<&str>, "/tmp", Some("tmpfs"), MsFlags::empty(), None::<&str>) {
         Ok(_) => {}
         Err(nix::errno::Errno::EBUSY) =>
             klog!("INFO: /tmp already mounted (resumed from previous attempt)"),
         Err(e) => fatal_error(&format!("Mount tmpfs on /tmp: {}", e)),
     }
+
+    // Step 2: copy the binary into RAM BEFORE releasing the squashfs.
     fs::copy(src, dst)
        .unwrap_or_else(|e| fatal_error(&format!("Copy updateinstaller to RAM: {}", e)));
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
        .unwrap_or_else(|e| fatal_error(&format!("chmod updateinstaller: {}", e)));
+    klog!("updateinstaller copied to RAM ({})", dst);
 
-    // Mount BP before unmounting SP so the updater can flash kernel/initramfs.
-    // The updater receives --bp-mount (the pre-existing path) rather than
-    // --bp-dev so it does not attempt a second mount() and fail with EBUSY.
-    let bp_mount = "/mnt/boot";
-    fs::create_dir_all(bp_mount)
-       .unwrap_or_else(|e| fatal_error(&format!("mkdir {}: {}", bp_mount, e)));
-    mount(Some(bp_dev), bp_mount, Some("vfat"), MsFlags::empty(), None::<&str>)
-       .unwrap_or_else(|e| fatal_error(&format!("Mount BP to {}: {}", bp_mount, e)));
+    // Step 3: fully release the active slot image.
+    // This unmounts the bind mounts in /system/rootfs/* that still reference
+    // the squashfs, then unmounts /system/base_root, then detaches the loop
+    // device. All steps are fatal on error – see unmount_active_slot_mounts().
+    unmount_active_slot_mounts(loop_dev_path);
 
-    // Unmount SP so the updater can repartition freely (BP stays mounted via /mnt/boot)
-    umount2("/mnt/system", MntFlags::MNT_DETACH)
-       .unwrap_or_else(|e| fatal_error(&format!("Umount SP before update: {}", e)));
+    // Step 4: SP stays mounted at /mnt/system.
+    // The updater reads /mnt/system/system/slot_*.img and writes pivot.config.
 
+    // Step 5: exec the updater from RAM.
+    klog!("Executing updateinstaller from RAM...");
     let err = Command::new(dst)
         .arg("--sp-dev").arg(sp_dev)
-        .arg("--bp-mount").arg(bp_mount)
+        .arg("--bp-dev").arg(bp_dev)
         .exec();
     fatal_error(&format!("exec updateinstaller failed: {}", err));
 }
