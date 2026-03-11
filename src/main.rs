@@ -106,9 +106,10 @@ enum BootMode {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(rename_all = "UPPERCASE")]
 enum ActiveSlot {
+    #[serde(alias = "a")]
     A,
+    #[serde(alias = "b")]
     B,
 }
 

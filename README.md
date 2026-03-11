@@ -157,8 +157,8 @@ slot_b = "base_system_b.img"
 
 * `system.active_slot`
 
-  * `A`
-  * `B`
+  * `a`
+  * `b`
 
 * `hardware.boot_partition_uuid`
 
