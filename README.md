@@ -1,144 +1,113 @@
-# pivot — FinchBerryOS initramfs
-**The first process. The last line of defense.**
+# pivot — FinchBerryOS initramfs PID 1
+**The first process. The root switcher. The boot-time assembler.**
 
-`pivot` is the PID 1 init binary embedded in the FinchBerryOS initramfs. Written entirely in **Rust** and statically linked against **musl libc**, it is responsible for assembling the final root filesystem from a read-only **SquashFS image** and persistent user data before handing control over to `syscored`.
+`pivot` is the PID 1 init binary embedded in the FinchBerryOS initramfs. It is written in **Rust**, intended to be **statically linked** (typically with **musl**), and is responsible for discovering the correct boot partitions, validating the writable system partition, assembling the final root filesystem, handling update mode, and finally handing control over to the real system init: `syscored`.
 
----
-
-## Boot Sequence Overview
-FinchBerryOS follows a strict, deterministic boot flow to ensure system integrity. `pivot` orchestrates this process in six distinct phases:
-
-1. **Environment Initialization**
-   - Kernel loads the **initramfs** and executes `pivot` as PID 1.
-   - `/dev` is mounted first (devtmpfs) so that `/dev/kmsg` is immediately available for kernel logging.
-   - `/proc` and `/sys` are then mounted.
-
-2. **Configuration & Discovery**
-   - `pivot` reads `pivot.config` (TOML) from the initramfs root.
-   - Hardware partitions are dynamically located by **parsing the GPT partition table directly** from the raw block device — no `udev`, no `blkid`, no static device paths.
-   - The **System Partition (SP)** is integrity-checked via `e2fsck` and then mounted to `/mnt/system`.
-
-3. **Update Verification (Optional)**
-   - **Condition:** Trigger file and update payload must coexist on the SP (double-flag principle).
-   - If met, `pivot` switches to **RAM Update Mode**, copying the flasher into a `tmpfs` and executing it entirely from memory to allow safe, atomic slot-swapping.
-
-4. **RootFS Construction**
-   - The active SquashFS image (A/B slot) is loop-mounted as the immutable base (`/system/base_root`).
-   - System directories and user data are layered into `/system/rootfs` using bind mounts.
-   - User applications on the SP are mounted directly as `/Applications` — no overlay, no compositing.
-
-5. **VFS Relocation**
-   - Active `/dev`, `/proc`, and `/sys` mounts are moved (`MS_MOVE`) into the new root.
-   - A fresh `tmpfs` is mounted at `/run`.
-   - This ensures all hardware state is preserved across the transition.
-
-6. **Switch Root & Handover**
-   - `/dev/console` is wired to `stdin`/`stdout`/`stderr` (fd 0/1/2) via `dup2`.
-   - `switch_root` is performed: `/system/rootfs` is bind-mounted onto itself (to become an explicit mountpoint), then moved atomically onto `/` via `MS_MOVE`, followed by `chroot(".")`.
-   - **Note:** `pivot_root(2)` is intentionally **not used** — it cannot be called from an initramfs because the initramfs tmpfs has no parent mountpoint entry in the kernel's mount namespace.
-   - **Final Step:** `exec /usr/libexec/syscored` replaces `pivot` as the permanent PID 1.
+`pivot` is designed to run on **embedded devices**, **laptops**, and **workstations** without depending on `udev`, `blkid`, or a fully populated userspace.
 
 ---
 
-## Error Handling
-Any unrecoverable error triggers a **kernel panic** via a two-stage mechanism:
+## What `pivot` does
 
-1. Write `c` to `/proc/sysrq-trigger` — produces a full kernel oops/backtrace on the console.
-2. Fallback: send `SIGABRT` to PID 1 via `nix` — the kernel is required to panic when PID 1 dies.
+At a high level, `pivot` performs these tasks:
 
-Panic behaviour (reboot, halt, timeout) is controlled entirely by the `panic=` kernel cmdline parameter, keeping policy out of the binary.
-
----
-
-## Boot Modes
-
-### Normal Boot
-The standard path. `pivot` mounts the active A/B slot image (SquashFS), connects it with the persistent folders on the SP (`Users`, `Library`, `private`, `Applications`), and switches into the resulting root.
-
-### Live / Installer Mode
-Defined in `pivot.config` with `mode = "live"`. Intended for installation media. This path is validated at parse time via a typed enum — invalid mode values cause an immediate fatal error.
-
-### RAM Update Mode
-Triggered by a **double-flag** check:
-1. `/mnt/system/private/system/StartUpdateInstaller` — trigger marker
-2. `/mnt/system/var/update/sys_update.fbuimg` — update payload
-
-Both must exist simultaneously. `pivot` copies the `updateinstaller` binary into RAM (`tmpfs`), mounts the Boot Partition (`/mnt/boot`, vfat) so the flasher can update kernel and initramfs, unmounts the SP to grant raw block access, and executes the updater entirely from RAM.
+1. Mounts the minimal kernel virtual filesystems required by early userspace
+2. Reads `/pivot.config` from the initramfs
+3. Locates the Boot Partition and System Partition by **direct GPT PARTUUID lookup**
+4. Runs `e2fsck` on the System Partition
+5. Mounts the System Partition
+6. Optionally enters **RAM update mode**
+7. Selects the active A/B system image
+8. Mounts the selected **SquashFS** image via a loop device
+9. Builds the final root filesystem using a mix of read-only and read-write bind mounts
+10. Moves `/dev`, `/proc`, and `/sys` into the new root
+11. Frees selected no-longer-needed initramfs content
+12. Switches root and `exec()`s `/usr/libexec/syscored`
 
 ---
 
-## Filesystem Architecture
-`pivot` constructs the root filesystem at `/system/rootfs`:
+## Design goals
 
-| Mount Point | Source | Mode | Description |
-| :--- | :--- | :--- | :--- |
-| `/System`, `/usr`, `/bin`, `/sbin` | SquashFS Image | **RO** | Immutable system core |
-| `/Applications` | System Partition | **RW** | User-installed applications |
-| `/Users` | System Partition | **RW** | User home directories |
-| `/Library` | System Partition | **RW** | Persistent app data & frameworks |
-| `/private` | System Partition | **RW** | Configs (`/etc`) and runtime data (`/var`) |
-| `/Volumes` | System Partition | **RW** | Central mount point for external media |
-| `/mnt/system` | System Partition | **RW** | Pass-through to the raw SP (slot images, updater) |
-| `/dev` | devtmpfs | **RW** | Kernel device nodes (moved from initramfs) |
-| `/proc` | procfs | **RO** | Kernel process information (moved from initramfs) |
-| `/sys` | sysfs | **RO** | Kernel hardware information (moved from initramfs) |
-| `/run` | tmpfs | **RW** | Volatile runtime data (PIDs, sockets) |
+`pivot` is built around a few strict design goals:
 
-### `/Applications`
-User-installed applications reside on the writable System Partition and are mounted directly as `/Applications`. System applications ship inside the SquashFS image under `/System/Applications/` and are part of the immutable read-only core — they are never mixed into `/Applications`.
+- **Run as PID 1 safely**
+- **Fail loudly and deterministically**
+- **Avoid userspace discovery dependencies**
+- **Support A/B system images**
+- **Keep the immutable OS read-only**
+- **Persist user and application data on the writable system partition**
+- **Work in minimal early-boot environments**
+- **Support update execution entirely from RAM when required**
 
-### `/Volumes`
-Does not contain permanent data. Serves as a dynamic mount point for external media (USB drives, etc.). The anchor directory lives on the System Partition so that `syscored` or other daemons can create subdirectories at runtime without touching the read-only SquashFS image.
-
-### `/private`
-Follows the macOS convention: `/etc` and `/var` are symlinks into `/private/etc` and `/private/var`. All mutable system configuration and runtime state lives here, persistent across reboots.
-
-### First Boot
-If any persistent directory (`Users`, `Library`, `private`, `Volumes`, `Applications`) does not yet exist on the SP, `pivot` creates it automatically. This makes the first-boot experience identical to all subsequent boots — no separate provisioning step required.
+This binary is primarily about **boot robustness**, **filesystem assembly**, and **root handoff**. It does **not** currently implement cryptographic image or update signature verification.
 
 ---
 
-## Configuration
-`pivot` expects a `/pivot.config` file in the root of the initramfs CPIO archive.
+## Boot flow
 
-```toml
-[system]
-mode = "installed"   # "installed" | "live"
-active_slot = "A"    # Current boot slot: "A" | "B"
+### 1. Early VFS setup
 
-[hardware]
-boot_partition_uuid   = "XXXX-XXXX"
-system_partition_uuid = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+`pivot` starts as PID 1 inside the initramfs and immediately mounts:
 
-[images]
-slot_a = "base_system_a.img"
-slot_b = "base_system_b.img"
-```
+- `/dev` as **devtmpfs**
+- `/proc` as **procfs**
+- `/sys` as **sysfs**
 
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `system.mode` | enum | `installed` = normal boot, `live` = installer/live media |
-| `system.active_slot` | enum | Which A/B slot to boot (`A` or `B`) |
-| `hardware.boot_partition_uuid` | PARTUUID | GPT partition GUID of the EFI/boot partition (vfat) |
-| `hardware.system_partition_uuid` | PARTUUID | GPT partition GUID of the system partition (ext4) |
-| `images.slot_a` / `slot_b` | filename | Filename of the SquashFS image within `/mnt/system/system/` |
+`/dev` is mounted first so that `/dev/kmsg` is available as early as possible.
+
+`/tmp` and `/run` are **not** mounted at this stage. They are created later inside the final root filesystem.
 
 ---
 
-## Build
-`pivot` is compiled as a fully static binary targeting musl libc:
+### 2. Panic handling and fatal errors
+
+A global Rust panic hook is installed before any meaningful setup happens.
+
+Any unrecoverable failure ends in `fatal_error()`, which:
+
+1. Logs the error to `/dev/kmsg` and `stderr`
+2. Attempts to trigger a kernel panic by writing `c` to `/proc/sysrq-trigger`
+3. Falls back to sending `SIGABRT` to PID 1
+4. Enters an infinite sleep loop as a last resort
+
+This ensures that PID 1 never simply exits quietly.
+
+---
+
+### 3. Configuration loading
+
+`pivot` reads `/pivot.config` from the initramfs root and parses it as TOML.
+
+The configuration defines:
+
+- boot mode
+- active A/B slot
+- GPT PARTUUIDs for the boot and system partitions
+- filenames of the slot images stored on the System Partition
+
+Invalid values are rejected immediately.
+
+---
+
+### 4. Partition discovery without `udev`
+
+Instead of using `udev`, `blkid`, or fixed `/dev/sdX` assumptions, `pivot` discovers the System Partition and Boot Partition by:
+
+- enumerating disks in `/sys/class/block`
+- skipping non-disk and virtual devices
+- opening raw block devices directly
+- parsing GPT headers and partition entries manually
+- matching the configured PARTUUID against raw GPT partition GUIDs
+
+If the primary GPT header is invalid, `pivot` can fall back to the **backup GPT header** stored at the last LBA of the disk.
+
+This approach allows partition discovery to work in a minimal initramfs with only `devtmpfs` and `sysfs`.
+
+---
+
+### 5. Filesystem check
+
+Before mounting the writable System Partition, `pivot` executes:
 
 ```sh
-cargo build --target x86_64-unknown-linux-musl --release
-# ARM embedded:
-cargo build --target aarch64-unknown-linux-musl --release
-```
-
-```toml
-# Cargo.toml dependencies
-[dependencies]
-nix     = { version = "0.29", features = ["mount", "unistd", "signal"] }
-loopdev = "0.4"
-serde   = { version = "1", features = ["derive"] }
-toml    = "0.8"
-```
+/sbin/e2fsck -p -f <system-partition>
