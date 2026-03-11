@@ -981,9 +981,9 @@ fn perform_pivot_and_exec() -> ! {
     }
 
     // Step 10: hand off to the real init
-    klog!("Executing /usr/libexec/syscored ...");
-    let err = Command::new("/usr/libexec/syscored").exec();
-    fatal_error(&format!("exec /usr/libexec/syscored failed: {}", err));
+    klog!("Executing /sbin/syscored ...");
+    let err = Command::new("/sbin/syscored").exec();
+    fatal_error(&format!("exec /sbin/syscored failed: {}", err));
 }
 
 /// Validate parsed config values beyond what serde can check.

@@ -1,6 +1,6 @@
 # pivot
 
-`pivot` is the early boot init binary for FinchBerryOS. It runs as **PID 1** inside the initramfs and prepares the real root filesystem before handing control to `/usr/libexec/syscored`.
+`pivot` is the early boot init binary for FinchBerryOS. It runs as **PID 1** inside the initramfs and prepares the real root filesystem before handing control to `/sbin/syscored`.
 
 It is written in Rust and is designed to work in a minimal early-boot environment without relying on `udev`, `blkid`, or fixed `/dev/sdX` paths.
 
@@ -25,7 +25,7 @@ At boot, `pivot` performs these main steps:
 * moves `/dev`, `/proc`, and `/sys` into the new root
 * mounts fresh tmpfs instances for `/run` and `/tmp`
 * cleans up selected old initramfs files
-* switches root and executes `/usr/libexec/syscored`
+* switches root and executes `/sbin/syscored`
 
 12. if update mode is requested:
 
@@ -305,7 +305,7 @@ The kernel must support:
 The selected system image must contain:
 
 ```
-/usr/libexec/syscored
+/sbin/syscored
 ```
 
 For update mode it must also contain:
@@ -350,4 +350,4 @@ nix     = { version = "0.29", features = ["mount", "signal", "fs", "process"] }
 * fully releases the active image before starting the updater
 * keeps the System Partition mounted during updates
 * switches root without using `pivot_root(2)`
-* hands off cleanly to `/usr/libexec/syscored`
+* hands off cleanly to `/sbin/syscored`
