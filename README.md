@@ -22,6 +22,7 @@
 - [Update Mode](#update-mode)
 - [Slot Selection](#slot-selection)
 - [Root Filesystem Assembly](#root-filesystem-assembly)
+- [Filesystem Layout After `pivot`](#filesystem-layout-after-pivot)
 - [Virtual Filesystem Relocation](#virtual-filesystem-relocation)
 - [Initramfs Cleanup](#initramfs-cleanup)
 - [Root Switch Sequence](#root-switch-sequence)
