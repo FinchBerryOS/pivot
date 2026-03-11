@@ -136,7 +136,7 @@ Example:
 ```toml
 [system]
 mode = "installed"
-active_slot = "A"
+active_slot = "a"
 
 [hardware]
 boot_partition_uuid   = "11111111-2222-3333-4444-555555555555"
