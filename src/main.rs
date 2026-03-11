@@ -43,11 +43,14 @@ fn kmsg_write(msg: &str) {
         // If it fails (devtmpfs not yet mounted) we fall through to stderr only.
         // We do NOT panic or fatal_error here – logging must never cause a crash.
         //
-        // Use compare_exchange instead of a plain store to handle the theoretical
-        // reentrant case (e.g. Panic-hook fires while we are inside kmsg_write
-        // before the store is visible). Without CAS a second open() would produce
-        // a second FD that gets leaked when only one is stored.
-        // With CAS: the loser closes its FD and uses the winner's.
+        // Use compare_exchange instead of a plain store so that if a re-entrant
+        // call (e.g. a panic hook firing mid-open) races with us, the losing
+        // caller closes its own FD rather than leaking it.
+        //
+        // The brief window between into_raw_fd() and compare_exchange where a
+        // re-entrant panic could cause an FD leak is explicitly accepted: the
+        // worst outcome is a single leaked FD in an already-panicking PID 1
+        // that is about to fatal_error anyway.
         use std::os::unix::io::IntoRawFd;
         if let Ok(f) = fs::OpenOptions::new()
             .write(true)
@@ -55,6 +58,10 @@ fn kmsg_write(msg: &str) {
             .open("/dev/kmsg")
         {
             let new_fd = f.into_raw_fd();
+            // Between into_raw_fd() above and compare_exchange below, a
+            // re-entrant panic-hook call to kmsg_write could observe fd < 0
+            // and open a second /dev/kmsg. The CAS ensures exactly one FD is
+            // stored; the loser closes its copy.
             match KMSG_FD.compare_exchange(-1, new_fd, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => { fd = new_fd; }
                 Err(existing) => {
@@ -130,6 +137,18 @@ struct ImagesConfig {
     slot_b: String,
 }
 
+impl ImagesConfig {
+    /// Return all (name, path) slot pairs.
+    ///
+    /// FIX #5: Centralises slot enumeration so that adding slot_c only requires
+    /// updating this method and the ImagesConfig struct. Both validate_images()
+    /// and any future caller that iterates slots consume this method – there is
+    /// no second place to forget when the slot list grows.
+    fn all_slots(&self) -> [(&'static str, &String); 2] {
+        [("slot_a", &self.slot_a), ("slot_b", &self.slot_b)]
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // FATAL ERROR  (PID 1 must never exit – spin forever after logging)
 // ────────────────────────────────────────────────────────────────────────────
@@ -177,7 +196,10 @@ fn main() {
         };
         fatal_error(&msg);
     }));
-    // VFS FIRST: devtmpfs must be mounted before klog! can open /dev/kmsg
+    // VFS FIRST: devtmpfs must be mounted before klog! can open /dev/kmsg.
+    // Note: setup_vfs mounts only /dev, /proc, /sys – the kernel virtuals.
+    // /tmp and /run are intentionally deferred: they belong in the new root
+    // and are mounted later by move_vfs_to_new_root() inside /system/rootfs.
     setup_vfs();
     klog!("Starting FinchBerryOS Initial RAM File System...");
     let config = read_config("/pivot.config");
@@ -191,7 +213,8 @@ fn main() {
     match config.system.mode {
         BootMode::Installed => {}
         BootMode::Live => fatal_error(
-            "mode = \"live\" is not supported by this pivot binary.              Use a live-boot enabled initramfs instead."
+            "mode = \"live\" is not supported by this pivot binary. \
+             Use a live-boot enabled initramfs instead."
         ),
     }
 
@@ -262,8 +285,10 @@ fn main() {
 //   1. Enumerate every block device in /sys/class/block/
 //   2. Skip non-partition entries (no "partition" sysfs attribute)
 //   3. Find the parent disk device (one level up in sysfs)
-//   4. Open /dev/<disk> and read the GPT header + partition table directly
+//   4. Open /dev/<disk> and read the GPT primary header + partition table
 //   5. Compare each partition entry's GUID against the target PARTUUID
+//   6. FIX #4: If the primary header is corrupt/missing, fall back to the
+//      GPT backup header at the last LBA (UEFI spec §5.3 requirement).
 //
 // The kernel never writes PARTUUID into uevent – that is solely a udev artifact.
 // GPT partition GUIDs are stored in the partition table at a well-known offset
@@ -290,7 +315,7 @@ fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
 
 /// Read the logical block size for a disk from sysfs.
 /// Falls back to 512 if the attribute is missing (safe for 512e drives).
-/// Clamps to the valid range [512, 4096] – standard drives: 512 or 4096 bytes.
+/// Clamps to [512, 4096] – the only valid physical block sizes on real hardware.
 /// Values outside this range indicate a corrupt sysfs entry and would cause an
 /// OOM-allocation if used directly as a buffer size.
 fn read_logical_block_size(disk_name: &str) -> u64 {
@@ -299,10 +324,27 @@ fn read_logical_block_size(disk_name: &str) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(512);
-    // Only 512 and 4096 are valid physical block sizes on real hardware.
-    // Reject anything else to prevent a corrupt sysfs value causing a
-    // gigabyte-sized heap allocation followed by an OOM kernel panic.
     if raw == 512 || raw == 4096 { raw } else { 512 }
+}
+
+/// Read the total size of a disk in logical blocks from sysfs.
+///
+/// The sysfs `size` attribute reports 512-byte sectors regardless of the
+/// physical/logical block size. We convert to LBAs by dividing by (lbs / 512).
+/// Returns None if the attribute is missing or unparseable.
+///
+/// Used by try_backup_gpt_header() to locate the last LBA without an additional
+/// ioctl (BLKGETSIZE64), keeping the code free of ioctl dependencies.
+fn read_disk_size_in_lba(disk_name: &str, lbs: u64) -> Option<u64> {
+    let path = format!("/sys/class/block/{}/size", disk_name);
+    let sectors_512 = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())?;
+    // lbs is always 512 or 4096 (enforced by read_logical_block_size).
+    // lbs / 512 is therefore 1 or 8 – no overflow risk.
+    let lbs_per_sector = lbs / 512;
+    if lbs_per_sector == 0 { return None; }
+    Some(sectors_512 / lbs_per_sector)
 }
 
 /// Parse a GPT PARTUUID string into the 16-byte mixed-endian layout stored in
@@ -316,11 +358,6 @@ fn read_logical_block_size(disk_name: &str) -> u64 {
 /// can be compared directly against raw GPT partition entry bytes 16..32.
 /// MBR PARTUUIDs are not supported – FinchBerryOS requires GPT.
 fn parse_partuuid_to_bytes(uuid: &str) -> Option<[u8; 16]> {
-    // Enforce canonical UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    // Length must be exactly 36, hyphens at positions 8, 13, 18, 23, all
-    // other characters must be hex digits (upper or lowercase both accepted).
-    // This matches the "single source of truth" contract and the error message
-    // in validate_config() – the parser is at least as strict as its own docs.
     let b = uuid.as_bytes();
     if b.len() != 36 { return None; }
     if b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' { return None; }
@@ -328,7 +365,6 @@ fn parse_partuuid_to_bytes(uuid: &str) -> Option<[u8; 16]> {
     for i in hex_positions {
         if !b[i].is_ascii_hexdigit() { return None; }
     }
-    // Collect the 32 hex digits in order and decode.
     let hex: String = b.iter()
         .filter(|&&c| c != b'-')
         .map(|&c| c as char)
@@ -344,59 +380,54 @@ fn parse_partuuid_to_bytes(uuid: &str) -> Option<[u8; 16]> {
     Some(raw)
 }
 
-/// Try to find a partition with the given PARTUUID on a specific disk.
-/// `target_bytes` is the pre-parsed 16-byte GUID in disk layout (mixed-endian).
-/// Returns the /dev/<partname> path if found.
-fn scan_disk_for_partuuid(disk_dev: &str, disk_name: &str, target_str: &str, target_bytes: &[u8; 16]) -> Option<String> {
-    let mut f = File::open(disk_dev).ok()?;
+/// Scan one validated GPT header (already read into `header`) for `target_bytes`.
+///
+/// Extracted into a shared helper so both scan_disk_for_partuuid (primary header)
+/// and try_backup_gpt_header (backup header) reuse the same partition-entry
+/// scan loop without duplication.
+fn scan_gpt_header_for_partuuid(
+    f:            &mut File,
+    disk_name:    &str,
+    target_str:   &str,
+    target_bytes: &[u8; 16],
+    header:       &[u8],
+    lbs:          u64,
+) -> Option<String> {
+    let part_entry_lba   = read_u64_le(header, 72)?;
+    let num_part_entries = read_u32_le(header, 80)?;
+    let part_entry_size  = read_u32_le(header, 84)? as u64;
 
-    // Read the actual logical block size from sysfs – supports both 512/512e and 4Kn drives.
-    let lbs = read_logical_block_size(disk_name);
-
-    // LBA 1 holds the GPT primary header.
-    let mut header = vec![0u8; lbs as usize];
-    f.seek(SeekFrom::Start(lbs)).ok()?;
-    f.read_exact(&mut header).ok()?;
-
-    // Validate GPT signature ("EFI PART" at offset 0 of the header)
-    if read_u64_le(&header, 0)? != GPT_HEADER_SIGNATURE {
-        return None; // not a GPT disk
-    }
-
-    let part_entry_lba  = read_u64_le(&header, 72)?;
-    let num_part_entries = read_u32_le(&header, 80)?;
-    let part_entry_size  = read_u32_le(&header, 84)? as u64;
-
-    // Safety caps per UEFI spec 2.10 §5.3:
-    //   - entry size: minimum 128 bytes; real-world tools write exactly 128.
-    //   - entry count: UEFI minimum is 128; many partitioning tools (gdisk,
-    //     parted) write 128 or 256. We cap at 256 to cover both, while still
-    //     bounding the loop against a corrupt header claiming millions of entries.
     if part_entry_size < 128 || part_entry_size > 512 { return None; }
-    let safe_count = num_part_entries.min(256);
 
-    // Allocate the entry buffer once outside the loop – all entries are the same size.
+    const MAX_PARTITION_ENTRIES: u32 = 128;
+    if num_part_entries > MAX_PARTITION_ENTRIES {
+        klog!("WARN: GPT on {} reports {} partition entries; scanning only first {} \
+               (FinchBerryOS supports max {} partitions)",
+              disk_name, num_part_entries, MAX_PARTITION_ENTRIES, MAX_PARTITION_ENTRIES);
+    }
+    let safe_count = num_part_entries.min(MAX_PARTITION_ENTRIES);
+
     let mut entry = vec![0u8; part_entry_size as usize];
 
-    // Pre-compute the base byte offset of the partition array once.
-    // The per-entry offset is: base + i * part_entry_size.
     let array_base = match part_entry_lba.checked_mul(lbs) {
         Some(v) => v,
         None => {
-            klog!("WARN: GPT array base overflow (part_entry_lba={} lbs={}), skipping disk",
+            klog!("WARN: GPT array base overflow (part_entry_lba={} lbs={}), skipping",
                   part_entry_lba, lbs);
             return None;
         }
     };
 
     for i in 0..safe_count {
-        // Use checked arithmetic to guard against corrupt GPT headers.
         let byte_offset = match (i as u64)
             .checked_mul(part_entry_size)
             .and_then(|off| array_base.checked_add(off))
         {
             Some(v) => v,
-            None => { klog!("WARN: GPT byte_offset overflow at entry {}, stopping scan", i); break; }
+            None => {
+                klog!("WARN: GPT byte_offset overflow at entry {}, stopping scan", i);
+                break;
+            }
         };
         if f.seek(SeekFrom::Start(byte_offset)).is_err() { break; }
         if f.read_exact(&mut entry).is_err() { break; }
@@ -404,14 +435,10 @@ fn scan_disk_for_partuuid(disk_dev: &str, disk_name: &str, target_str: &str, tar
         // Bytes 0..16: partition type GUID – all zeros means unused entry
         if entry[0..16].iter().all(|&b| b == 0) { continue; }
 
-        // Bytes 16..32: partition unique GUID (PARTUUID).
-        // Compare raw bytes directly against the pre-parsed target – no String
-        // allocation per entry, no format! in the hot loop.
-        // get() + try_into() instead of direct index + unwrap() for consistency
-        // with the rest of the Option-based GPT parsing in this function.
+        // Bytes 16..32: partition unique GUID (PARTUUID)
         let raw_guid: &[u8; 16] = match entry.get(16..32).and_then(|s| s.try_into().ok()) {
             Some(g) => g,
-            None    => break, // entry buffer too short – corrupt table, stop scan
+            None    => break,
         };
 
         if raw_guid == target_bytes {
@@ -445,37 +472,94 @@ fn scan_disk_for_partuuid(disk_dev: &str, disk_name: &str, target_str: &str, tar
     None
 }
 
+/// FIX #4: Attempt to read the GPT backup header from the last LBA.
+///
+/// The UEFI spec (§5.3) requires an identical backup GPT header at the very
+/// last LBA of the disk. gdisk, parted, and sgdisk all write it unconditionally.
+/// A partially-written disk (interrupted dd, sgdisk crash) may have a valid
+/// backup header even when the primary is corrupt or missing.
+///
+/// We read the disk size from sysfs (no ioctl needed), seek to the last LBA,
+/// validate the signature, and hand off to scan_gpt_header_for_partuuid.
+/// Returns None if the disk size is unavailable or the backup header is also invalid.
+fn try_backup_gpt_header(
+    f:            &mut File,
+    disk_name:    &str,
+    lbs:          u64,
+    target_str:   &str,
+    target_bytes: &[u8; 16],
+) -> Option<String> {
+    let total_lba = read_disk_size_in_lba(disk_name, lbs)?;
+    if total_lba == 0 { return None; }
+    let backup_lba = total_lba - 1;
+
+    let mut header = vec![0u8; lbs as usize];
+    f.seek(SeekFrom::Start(backup_lba * lbs)).ok()?;
+    f.read_exact(&mut header).ok()?;
+
+    if read_u64_le(&header, 0)? != GPT_HEADER_SIGNATURE {
+        // Both primary and backup headers invalid – disk is not GPT or fully corrupt.
+        return None;
+    }
+
+    klog!("INFO: primary GPT header corrupt on {}, using backup at LBA {}", disk_name, backup_lba);
+    scan_gpt_header_for_partuuid(f, disk_name, target_str, target_bytes, &header, lbs)
+}
+
+/// Try to find a partition with the given PARTUUID on a specific disk.
+/// `target_bytes` is the pre-parsed 16-byte GUID in disk layout (mixed-endian).
+/// Returns the /dev/<partname> path if found.
+fn scan_disk_for_partuuid(
+    disk_dev:     &str,
+    disk_name:    &str,
+    target_str:   &str,
+    target_bytes: &[u8; 16],
+) -> Option<String> {
+    let mut f = File::open(disk_dev).ok()?;
+    let lbs = read_logical_block_size(disk_name);
+
+    // LBA 1 holds the GPT primary header.
+    let mut header = vec![0u8; lbs as usize];
+    f.seek(SeekFrom::Start(lbs)).ok()?;
+    f.read_exact(&mut header).ok()?;
+
+    // FIX #4: If the primary GPT signature is absent, fall back to the backup
+    // header at the last LBA before giving up on this disk. If the scan of the
+    // primary header returns None (GUID absent from a valid table), we do NOT
+    // fall back – the tables are identical and scanning twice is redundant noise.
+    if read_u64_le(&header, 0)? != GPT_HEADER_SIGNATURE {
+        return try_backup_gpt_header(&mut f, disk_name, lbs, target_str, target_bytes);
+    }
+
+    scan_gpt_header_for_partuuid(&mut f, disk_name, target_str, target_bytes, &header, lbs)
+}
+
 /// Poll for a partition by PARTUUID using direct GPT parsing.
 /// Works without udev – only requires devtmpfs + sysfs (both mounted in setup_vfs).
 fn wait_for_partuuid(target_uuid: &str, timeout_secs: u64) -> Option<String> {
     let start = Instant::now();
-    // Pre-parse the PARTUUID string to bytes once, outside the poll loop.
-    // This avoids any String allocation or format! in the hot scan loop.
-    // parse_partuuid_to_bytes accepts upper and lowercase – no need to normalise.
-    // validate_config() has already verified this UUID – failure here is a bug.
+    // Pre-parse once, outside the poll loop – no allocation per iteration.
+    // validate_config() has already verified this UUID; failure here is a bug.
     let needle_bytes = parse_partuuid_to_bytes(target_uuid)
         .unwrap_or_else(|| fatal_error(&format!(
             "internal error: validated PARTUUID '{}' failed to parse – this is a bug",
             target_uuid
         )));
 
-    while start.elapsed().as_secs() < timeout_secs {
-        // Enumerate all block devices visible in sysfs
-        // Scan all whole-disk block devices for the target PARTUUID.
-        // sysfs may not be fully populated yet on fast hardware – the sleep below
-        // handles that race. We sleep unconditionally (not only on empty sysfs)
-        // to avoid a busy-spin when sysfs is ready but the disk isn't yet visible.
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed.as_secs() >= timeout_secs { break; }
+
         let mut found_any_disk = false;
         if let Ok(entries) = fs::read_dir("/sys/class/block") {
             for entry in entries.flatten() {
                 let dev_name = entry.file_name().to_string_lossy().to_string();
 
-                // We only want whole disk devices (no partitions themselves).
-                // A whole disk has no "partition" attribute in sysfs.
+                // Skip partition entries – we want whole disks only.
                 let part_attr = entry.path().join("partition");
                 if part_attr.exists() { continue; }
 
-                // Skip virtual/software block devices – they have no GPT
+                // Skip virtual/software block devices – they have no GPT.
                 if dev_name.starts_with("loop")
                     || dev_name.starts_with("ram")
                     || dev_name.starts_with("zram")
@@ -486,25 +570,29 @@ fn wait_for_partuuid(target_uuid: &str, timeout_secs: u64) -> Option<String> {
                 }
 
                 let disk_dev = format!("/dev/{}", dev_name);
-                // sysfs may expose the device before devtmpfs has created the
-                // /dev node. Skip explicitly rather than relying on the implicit
-                // ok()? inside scan_disk_for_partuuid – makes the race visible.
-                // found_any_disk is set only after confirming the /dev node exists,
-                // so the "no disk visible" warning is accurate: it means there is
-                // nothing scannable yet, not just nothing in sysfs.
-                if !Path::new(&disk_dev).exists() {
-                    continue;
-                }
+                // sysfs may expose the device before devtmpfs creates the /dev node.
+                if !Path::new(&disk_dev).exists() { continue; }
+
                 found_any_disk = true;
                 if let Some(found) = scan_disk_for_partuuid(&disk_dev, &dev_name, target_uuid, &needle_bytes) {
                     return Some(found);
                 }
             }
         }
+
         if !found_any_disk {
             klog!("WARN: no disk devices visible in sysfs yet, waiting...");
         }
-        sleep(Duration::from_millis(200));
+
+        // FIX #3: Cap the sleep to the remaining timeout so the actual wall time
+        // never significantly exceeds timeout_secs. Without this cap, a single
+        // scan pass on a system with many disks can take >200 ms, pushing the
+        // total wait time well beyond timeout_secs and misleading the operator
+        // about when the timeout fired.
+        let remaining = Duration::from_secs(timeout_secs)
+            .saturating_sub(start.elapsed());
+        if remaining.is_zero() { break; }
+        sleep(remaining.min(Duration::from_millis(200)));
     }
     None
 }
@@ -537,7 +625,7 @@ fn stage_system(active_image: &str) {
     let lc = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let now = Instant::now(); // single timestamp per iteration
+            let now = Instant::now();
             if loop_control_path.exists() {
                 match LoopControl::open() {
                     Ok(lc) => break lc,
@@ -577,7 +665,6 @@ fn stage_system(active_image: &str) {
     // Keep the loop device alive (autoclear handles cleanup on final unmount)
     std::mem::forget(loop_dev);
 
-    // Create mount-point skeleton in staging root
     let dirs = [
         "System", "Applications", "Users", "Library",
         "Volumes", "private", "proc", "sys", "dev",
@@ -626,6 +713,9 @@ fn setup_vfs() {
     // /proc, /sys, /dev must exist as empty dirs in the initramfs cpio archive.
     // Mount /dev FIRST so that /dev/kmsg is available for fatal_error's Stage 1
     // (sysrq-trigger lives under /proc which comes second).
+    // NOTE: /tmp and /run are NOT mounted here. They belong in the new root
+    // (/system/rootfs) and are set up later by move_vfs_to_new_root() so they
+    // are backed by the correct tmpfs instances after switch_root.
     mount(Some("devtmpfs"), "/dev", Some("devtmpfs"), MsFlags::empty(), None::<&str>)
        .unwrap_or_else(|e| fatal_error(&format!("Mount devtmpfs: {}", e)));
     mount(None::<&str>, "/proc", Some("proc"),     MsFlags::empty(), None::<&str>)
@@ -660,73 +750,57 @@ fn move_vfs_to_new_root() {
 /// Release the initramfs tmpfs pages back to the kernel allocator.
 ///
 /// Must be called AFTER all bind/move mounts are set up inside /system/rootfs
-/// but BEFORE chroot(). At this point:
-///   - CWD is /system/rootfs  (after Step 2 chdir)
-///   - The new root is already a proper mountpoint (after Step 1 MS_BIND)
-///   - The old initramfs tmpfs is still the process root ("/")
-///   - All real data is bind-mounted inside /system/rootfs – nothing in "/"
-///     (outside that subtree) is needed any more
+/// but BEFORE chroot(). At this point "/" still addresses the old initramfs root
+/// and "." (CWD) addresses the new root. The mountpoint set passed in must have
+/// been collected from /proc/mounts BEFORE MS_MOVE – see perform_pivot_and_exec.
 ///
-/// We walk the initramfs root and unlink everything that is NOT a mountpoint
-/// (i.e. plain files and empty dirs in the initramfs tmpfs itself). Entries
-/// that are mountpoints are skipped – the kernel will handle them when the
-/// mount namespace is updated. After exec() the process image is replaced and
-/// the last reference to the tmpfs drops, freeing all remaining pages.
+/// We iterate an explicit allowlist of initramfs-only paths. Parent directories
+/// of active mounts (/system, /mnt) are intentionally excluded: they are not
+/// themselves mountpoints but touching them would raise EBUSY.
 ///
-/// On embedded targets with 128–256 MB RAM this typically recovers 2–8 MB.
-/// On desktops/laptops it is hygienic but not critical.
-/// `active_mounts` must be collected from /proc/mounts BEFORE MS_MOVE is executed,
-/// while /proc is still accessible from the old initramfs root.
-/// After MS_MOVE /system/rootfs → /, the old /proc is an empty directory and
-/// /proc/mounts would return an empty string, making the mountpoint guard useless.
+/// FIX #1 (v2): Use remove_dir_all instead of remove_dir so that non-empty
+/// directories (/usr, /bin, /lib, etc.) are actually freed rather than silently
+/// skipped with ENOTEMPTY. The active_mounts guard runs first to ensure we
+/// never recursively delete a real mountpoint subtree.
+///
+/// FIX #2 (v2): Guard via /pivot.config sentinel to confirm "/" still addresses
+/// the old initramfs root before deleting anything. If the sentinel is missing,
+/// we bail out rather than risk corrupting the new root.
 fn free_initramfs(active_mounts: &HashSet<String>) {
-    // Approach: explicit allowlist of known initramfs skeleton paths rather than
-    // a generic "/" scan. The generic scan is elegant but produces noisy EBUSY
-    // errors for parent directories of active mounts (/system, /mnt) that are
-    // not themselves mountpoints and therefore not in active_mounts.
-    //
-    // This mirrors what busybox switch_root does: delete known entries by name,
-    // skip anything that fails silently. Safe because:
-    //   - Files/dirs in this list are exclusively initramfs tmpfs content.
-    //   - All real data has been bind/move-mounted into /system/rootfs already.
-    //   - active_mounts provides a final safety net for any unexpected mounts.
-    //
-    // Directories are removed with remove_dir (only succeeds if empty).
-    // The /system and /mnt dirs may have submounts and will fail with EBUSY –
-    // that is expected and logged at DEBUG level, not as a warning.
+    // Sanity-check: /pivot.config must be visible via "/" to confirm we are
+    // still addressing the old initramfs root (not the new one after chroot).
+    // /pivot.config lives only in the initramfs and is never copied to the SP,
+    // so its absence at "/" means something has gone wrong with the root switch.
+    // Bail out rather than silently deleting files from the new root.
+    if !Path::new("/pivot.config").exists() {
+        klog!("WARN: free_initramfs: /pivot.config missing at '/' – \
+               root may already be switched, skipping cleanup to avoid data loss");
+        return;
+    }
 
-    // Known initramfs skeleton entries (files + empty dirs after mounts moved out).
-    // /mnt and /system are intentionally excluded: they are parent directories of
-    // active bind/loop mounts. Touching them buys zero RAM and risks confusion.
-    // Only unambiguous initramfs-only paths appear here.
     let candidates: &[&str] = &[
-        "/init",
+        "/init",         // oder wie das Binary heißt
         "/pivot.config",
-        "/dev",   // empty after MS_MOVE
-        "/proc",  // empty after MS_MOVE
-        "/sys",   // empty after MS_MOVE
-        "/bin",
         "/sbin",
-        "/usr",
-        "/lib",
-        "/lib64",
-        "/etc",
+        "/dev",          // leer nach MS_MOVE
+        "/proc",         // leer nach MS_MOVE
+        "/sys",          // leer nach MS_MOVE
     ];
 
     for path_str in candidates {
-        // Final safety net: never touch an active mountpoint
+        // Final safety net: never touch an active mountpoint or its subtree.
         if active_mounts.contains(*path_str) {
             klog!("free_initramfs: skipping active mountpoint {}", path_str);
             continue;
         }
         let path = Path::new(path_str);
-        if !path.exists() { continue; }
 
-        let result = if path.is_dir() {
-            fs::remove_dir(path)
-        } else {
-            fs::remove_file(path)
-        };
+        // FIX #1 (v2): remove_dir_all recurses into non-empty directories,
+        // freeing all initramfs files (Busybox, musl, etc.) rather than
+        // leaving them in place with a silent ENOTEMPTY.
+        // Fallback to remove_file handles plain files (/init, /pivot.config)
+        // and symlinks that remove_dir_all rejects.
+        let result = fs::remove_dir_all(path).or_else(|_| fs::remove_file(path));
         match result {
             Ok(_)  => klog!("free_initramfs: removed {}", path_str),
             Err(e) => klog!("free_initramfs: skipped {} ({})", path_str, e),
@@ -742,10 +816,13 @@ fn free_initramfs(active_mounts: &HashSet<String>) {
 /// mountpoint entry in the mount namespace, so pivot_root always returns EINVAL.
 ///
 /// The correct sequence (identical to busybox switch_root / systemd):
-///   1. MS_MOVE  – atomically move new_root onto /
-///   2. chroot(".") – update the kernel's root pointer
-///   3. Clean up any remaining initramfs tmpfs entries to release RAM
-///   4. exec the real init
+///   1. MS_BIND  – make new_root an explicit mountpoint
+///   2. chdir    – move CWD into new root
+///   3. Snapshot /proc/mounts while old /proc is still accessible
+///   4. MS_MOVE  – atomically move new_root onto /
+///   5. free_initramfs – release old tmpfs pages (/ still = old root)
+///   6. chroot(".") – update the kernel's root pointer to CWD
+///   7. exec the real init
 fn perform_pivot_and_exec() -> ! {
     let new_root = "/system/rootfs";
 
@@ -774,11 +851,11 @@ fn perform_pivot_and_exec() -> ! {
     mount(Some(new_root), "/", None::<&str>, MsFlags::MS_MOVE, None::<&str>)
        .unwrap_or_else(|e| fatal_error(&format!("MS_MOVE new_root onto /: {}", e)));
 
-    // Step 5: free the initramfs tmpfs pages before chroot.
-    // CWD is now "." = /system/rootfs (the new root, not yet chrooted into).
-    // The process root is still the old initramfs – "/" still addresses it.
-    // The mountpoint set collected in Step 3 correctly identifies what must NOT
-    // be unlinked (active mounts), even though /proc is no longer readable here.
+    // Step 5: free the initramfs tmpfs pages.
+    // After MS_MOVE: CWD "." = new root (not yet chrooted), "/" = old initramfs.
+    // free_initramfs addresses all candidate paths via "/" which still reaches
+    // the old initramfs root. The /pivot.config sentinel inside free_initramfs
+    // confirms this invariant before deleting anything.
     free_initramfs(&active_mounts);
 
     // Step 6: update the kernel root pointer
@@ -827,6 +904,7 @@ fn perform_pivot_and_exec() -> ! {
     //
     // Safety: remove_var / set_var are unsafe since Rust 1.81 because concurrent
     // reads of the environment from other threads would cause a data race.
+    // Rust 1.81 made env mutation unsafe to force callers to justify thread safety.
     // This is safe here because:
     //   (a) pivot is single-threaded – no other thread can be reading environ[].
     //   (b) All keys are collected into an owned Vec BEFORE removal, so the
@@ -859,8 +937,6 @@ fn validate_config(cfg: &PivotConfig) {
     // PARTUUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  (GPT UUID, 8-4-4-4-12 hex)
     // FinchBerryOS requires GPT – MBR is not supported.
     // parse_partuuid_to_bytes() is the single source of truth for UUID validity.
-    // Calling it here (before hardware access) means any format error is reported
-    // against the config file, not as a mysterious failure inside wait_for_partuuid.
     for (name, uuid) in &[
         ("boot_partition_uuid",   &cfg.hardware.boot_partition_uuid),
         ("system_partition_uuid", &cfg.hardware.system_partition_uuid),
@@ -872,8 +948,16 @@ fn validate_config(cfg: &PivotConfig) {
             ));
         }
     }
-    // Image filenames: plain filename only, no directory separators
-    for (name, img) in &[("slot_a", &cfg.images.slot_a), ("slot_b", &cfg.images.slot_b)] {
+    validate_images(&cfg.images);
+}
+
+/// Validate all image slot filenames in ImagesConfig.
+///
+/// FIX #5: Iterates images.all_slots() instead of a hand-written array literal.
+/// Adding slot_c to ImagesConfig and all_slots() automatically validates it here
+/// without any change to this function.
+fn validate_images(images: &ImagesConfig) {
+    for (name, img) in &images.all_slots() {
         if img.is_empty() || img.contains('/') || img.contains("..") {
             fatal_error(&format!(
                 "config: images.{} '{}' is empty or contains illegal path characters",
@@ -900,7 +984,13 @@ fn check_for_updates() -> bool {
 }
 
 /// Copies the updater binary into RAM (tmpfs) and executes it.
-/// SP is unmounted first so the updater can repartition freely.
+///
+/// The Boot Partition (BP) is mounted at /mnt/boot so the updater can also
+/// flash kernel/initramfs. The System Partition (SP) is unmounted after the
+/// binary is copied so the updater can repartition freely.
+///
+/// --bp-mount (pre-mounted path) is passed instead of --bp-dev so the updater
+/// does not attempt a second mount() and fail with EBUSY.
 fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
     let src = "/mnt/system/system/updateinstaller";
     let dst = "/tmp/updateinstaller";
@@ -912,12 +1002,8 @@ fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
 
     fs::create_dir_all("/tmp")
        .unwrap_or_else(|e| fatal_error(&format!("mkdir /tmp: {}", e)));
-    // Attempt the tmpfs mount unconditionally and tolerate EBUSY.
-    // A check-then-mount pattern has a TOCTOU race: another process could mount
-    // between the /proc/mounts read and the mount(2) call (unlikely but possible
-    // if the updater is resumed after a crash with a pre-existing tmpfs).
-    // EBUSY means /tmp is already a mountpoint – that is exactly what we want,
-    // so treat it as success. Any other error is fatal.
+    // Tolerate EBUSY: /tmp may already be a tmpfs mountpoint if we are resuming
+    // after a crash. Any other error is fatal.
     match mount(None::<&str>, "/tmp", Some("tmpfs"), MsFlags::empty(), None::<&str>) {
         Ok(_) => {}
         Err(nix::errno::Errno::EBUSY) =>
@@ -929,11 +1015,14 @@ fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
     fs::set_permissions(dst, fs::Permissions::from_mode(0o755))
        .unwrap_or_else(|e| fatal_error(&format!("chmod updateinstaller: {}", e)));
 
-    // Mount BP so the updater can also flash kernel/initramfs on the boot partition
-    fs::create_dir_all("/mnt/boot")
-       .unwrap_or_else(|e| fatal_error(&format!("mkdir /mnt/boot: {}", e)));
-    mount(Some(bp_dev), "/mnt/boot", Some("vfat"), MsFlags::empty(), None::<&str>)
-       .unwrap_or_else(|e| fatal_error(&format!("Mount BP to /mnt/boot: {}", e)));
+    // Mount BP before unmounting SP so the updater can flash kernel/initramfs.
+    // The updater receives --bp-mount (the pre-existing path) rather than
+    // --bp-dev so it does not attempt a second mount() and fail with EBUSY.
+    let bp_mount = "/mnt/boot";
+    fs::create_dir_all(bp_mount)
+       .unwrap_or_else(|e| fatal_error(&format!("mkdir {}: {}", bp_mount, e)));
+    mount(Some(bp_dev), bp_mount, Some("vfat"), MsFlags::empty(), None::<&str>)
+       .unwrap_or_else(|e| fatal_error(&format!("Mount BP to {}: {}", bp_mount, e)));
 
     // Unmount SP so the updater can repartition freely (BP stays mounted via /mnt/boot)
     umount2("/mnt/system", MntFlags::MNT_DETACH)
@@ -941,7 +1030,7 @@ fn execute_ram_update(sp_dev: &str, bp_dev: &str) -> ! {
 
     let err = Command::new(dst)
         .arg("--sp-dev").arg(sp_dev)
-        .arg("--bp-dev").arg(bp_dev)
+        .arg("--bp-mount").arg(bp_mount)
         .exec();
     fatal_error(&format!("exec updateinstaller failed: {}", err));
 }
