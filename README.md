@@ -169,11 +169,7 @@ If both are present, `pivot`:
 4. unmounts the System Partition
 5. runs the updater from RAM
 
-The updater is launched like this:
 
-```text
-/tmp/updateinstaller --sp-dev <system partition> --bp-mount /mnt/boot
-```
 
 ---
 
