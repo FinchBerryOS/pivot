@@ -1,4 +1,7 @@
 # pivot
+<p align="center">
+  <img src="https://raw.githubusercontent.com/FinchBerryOS/.github/refs/heads/main/profile/assets/pivot_github.png" alt="FinchBerryOS Logo" width="400">
+</p>
 
 `pivot` is the early boot init binary for FinchBerryOS. It is normally intended to run as **PID 1** during early boot and prepares the real root filesystem before handing control to `/sbin/syscored`.
 
